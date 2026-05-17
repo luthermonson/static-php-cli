@@ -150,8 +150,11 @@
         "static-libs-unix": [
             "libintl.a"
         ],
-        "lib-depends": [
+        "lib-depends-unix": [
             "libiconv"
+        ],
+        "lib-depends-windows": [
+            "libiconv-win"
         ],
         "lib-suggests": [
             "ncurses",
