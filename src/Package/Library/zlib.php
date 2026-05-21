@@ -18,7 +18,10 @@ class zlib
     #[BuildFor('Darwin')]
     public function build(LibraryPackage $lib): void
     {
-        UnixAutoconfExecutor::create($lib)->exec("./configure --static --prefix={$lib->getBuildRootPath()}")->make();
+        UnixAutoconfExecutor::create($lib)
+            ->exec("./configure --static --prefix={$lib->getBuildRootPath()}")
+            ->exec("sed -i 's/-DNO_STRERROR//;s/-DNO_vsnprintf//' Makefile")
+            ->make();
 
         // Patch pkg-config file
         $lib->patchPkgconfPrefix(['zlib.pc'], PKGCONF_PATCH_PREFIX);
