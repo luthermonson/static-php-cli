@@ -20,7 +20,7 @@ class zlib
     {
         UnixAutoconfExecutor::create($lib)
             ->exec("./configure --static --prefix={$lib->getBuildRootPath()}")
-            ->exec("sed -i 's/-DNO_STRERROR//;s/-DNO_vsnprintf//' Makefile")
+            ->exec("sed -i.bak 's/-DNO_STRERROR//;s/-DNO_vsnprintf//' Makefile && rm -f Makefile.bak")
             ->make('libz.a');
 
         // Patch pkg-config file

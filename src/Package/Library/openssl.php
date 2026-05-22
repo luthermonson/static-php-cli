@@ -42,7 +42,7 @@ class openssl
         $perl = ApplicationContext::get('perl');
         $cmd = cmd()->cd($lib->getSourceDir())
             ->exec(
-                "{$perl} Configure zlib VC-WIN64A " .
+                quote($perl) . " Configure zlib VC-WIN64A " .
                 'no-shared ' .
                 '--prefix=' . quote($lib->getBuildRootPath()) . ' ' .
                 '--with-zlib-lib=' . quote($lib->getLibDir()) . ' ' .
@@ -124,7 +124,7 @@ class openssl
                 "linux-{$arch}"
             )
             ->exec('make clean')
-            ->exec("make -j{$lib->getBuilder()->concurrency} CNF_EX_LIBS=\"{$ex_lib}\"")
+            ->exec("make -j{$lib->getBuilder()->concurrency} build_sw CNF_EX_LIBS=\"{$ex_lib}\"")
             ->exec('make install_sw');
         $this->patchPkgConfig($lib);
     }
