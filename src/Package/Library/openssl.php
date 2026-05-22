@@ -124,8 +124,8 @@ class openssl
                 "linux-{$arch}"
             )
             ->exec('make clean')
-            ->exec("make -j{$lib->getBuilder()->concurrency} build_sw CNF_EX_LIBS=\"{$ex_lib}\"")
-            ->exec('make install_sw');
+            ->exec("make -j{$lib->getBuilder()->concurrency} build_libs CNF_EX_LIBS=\"{$ex_lib}\"")
+            ->exec('make install_dev');
         $this->patchPkgConfig($lib);
     }
 
