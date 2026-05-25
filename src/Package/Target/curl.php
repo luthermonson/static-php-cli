@@ -54,7 +54,7 @@ class curl
                 '-DCURL_USE_LIBSSH2=ON',
                 '-DENABLE_IPV6=ON',
                 '-DOPENSSL_ROOT_DIR=' . BUILD_ROOT_PATH,
-                '-DCMAKE_EXE_LINKER_FLAGS=/DEFAULTLIB:libcmt /LIBPATH:' . BUILD_LIB_PATH . ' libssl.lib libcrypto.lib ws2_32.lib crypt32.lib advapi32.lib',
+                '-DCMAKE_EXE_LINKER_FLAGS="/DEFAULTLIB:libcmt /LIBPATH:' . BUILD_LIB_PATH . ' libssl.lib libcrypto.lib ws2_32.lib crypt32.lib advapi32.lib"',
             )
             ->build();
         // move libcurl.lib to libcurl_a.lib
