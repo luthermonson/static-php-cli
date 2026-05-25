@@ -39,7 +39,7 @@ class curl
             ->optionalPackage('zstd', ...cmake_boolean_args('CURL_ZSTD'))
             ->optionalPackage('brotli', ...cmake_boolean_args('CURL_BROTLI'))
             ->addConfigureArgs(
-                '-DBUILD_CURL_EXE=ON',
+                '-DBUILD_CURL_EXE=OFF',
                 '-DZSTD_LIBRARY=' . BUILD_LIB_PATH . '\\zstd_static.lib',
                 '-DBUILD_TESTING=OFF',
                 '-DBUILD_EXAMPLES=OFF',
@@ -54,7 +54,6 @@ class curl
                 '-DCURL_USE_LIBSSH2=ON',
                 '-DENABLE_IPV6=ON',
                 '-DOPENSSL_ROOT_DIR=' . BUILD_ROOT_PATH,
-                '-DCMAKE_EXE_LINKER_FLAGS="' . BUILD_LIB_PATH . '\\libssl.lib ' . BUILD_LIB_PATH . '\\libcrypto.lib ws2_32.lib crypt32.lib advapi32.lib"',
             )
             ->build();
         // move libcurl.lib to libcurl_a.lib
