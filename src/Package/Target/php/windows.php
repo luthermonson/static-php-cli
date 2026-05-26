@@ -715,7 +715,7 @@ C_CODE;
             $include_flags,
             BUILD_ROOT_PATH,
             $config['libs'],
-            'kernel32.lib ole32.lib user32.lib advapi32.lib shell32.lib ws2_32.lib dnsapi.lib psapi.lib bcrypt.lib'  // Windows system libs (match Makefile LIBS)
+            'kernel32.lib ole32.lib user32.lib advapi32.lib shell32.lib ws2_32.lib dnsapi.lib psapi.lib bcrypt.lib pathcch.lib'
         );
 
         // Log command explicitly (workaround for cmd() not logging complex commands properly)
