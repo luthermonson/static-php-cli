@@ -337,7 +337,7 @@ trait windows
         // so php_embed.obj references symbols directly instead of through __imp_ thunks.
         $content = preg_replace(
             '/^CFLAGS_EMBED=(.+)$/m',
-            'CFLAGS_EMBED=$1 /D PHP_EXPORTS /D LIBZEND_EXPORTS /D SAPI_EXPORTS /D TSRM_EXPORTS',
+            'CFLAGS_EMBED=$1 /D PHP_EXPORTS /D LIBZEND_EXPORTS /D SAPI_EXPORTS',
             $content,
             1
         );
