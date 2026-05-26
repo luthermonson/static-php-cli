@@ -698,7 +698,8 @@ C_CODE;
         $zts_define = $ts ? ' /D ZTS=1' : '';
         $include_flags = sprintf(
             '/I"%s" /I"%s\main" /I"%s\Zend" /I"%s\TSRM" /I"%s" ' .
-            '/D ZEND_WIN32=1 /D PHP_WIN32=1 /D WIN32 /D _WINDOWS /D WINDOWS=1 /D _MBCS /D _USE_MATH_DEFINES%s',
+            '/D ZEND_WIN32=1 /D PHP_WIN32=1 /D WIN32 /D _WINDOWS /D WINDOWS=1 /D _MBCS /D _USE_MATH_DEFINES' .
+            ' /D PHP_EXPORTS /D LIBZEND_EXPORTS /D SAPI_EXPORTS /D TSRM_EXPORTS%s',
             $build_dir,
             $source_dir,
             $source_dir,
