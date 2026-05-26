@@ -335,9 +335,12 @@ trait windows
         // Embed SAPI objects are compiled as DLL consumers (dllimport for PHP/Zend APIs).
         // For our fat static lib, they need direct linkage. Add export defines to CFLAGS_EMBED
         // so php_embed.obj references symbols directly instead of through __imp_ thunks.
+        // Note: TSRM_EXPORTS is intentionally omitted — on MSVC, extern __declspec(dllexport)
+        // on the TLS variable _tsrm_ls_cache creates a duplicate definition (LNK4006) that
+        // corrupts the binary under /FORCE:MULTIPLE. TSRM functions use dllimport fixup instead.
         $content = preg_replace(
             '/^CFLAGS_EMBED=(.+)$/m',
-            'CFLAGS_EMBED=$1 /D PHP_EXPORTS /D LIBZEND_EXPORTS /D SAPI_EXPORTS /D TSRM_EXPORTS',
+            'CFLAGS_EMBED=$1 /D PHP_EXPORTS /D LIBZEND_EXPORTS /D SAPI_EXPORTS',
             $content,
             1
         );
@@ -709,7 +712,7 @@ C_CODE;
         $include_flags = sprintf(
             '/I"%s" /I"%s\main" /I"%s\Zend" /I"%s\TSRM" /I"%s" ' .
             '/D ZEND_WIN32=1 /D PHP_WIN32=1 /D WIN32 /D _WINDOWS /D WINDOWS=1 /D _MBCS /D _USE_MATH_DEFINES' .
-            ' /D PHP_EXPORTS /D LIBZEND_EXPORTS /D SAPI_EXPORTS /D TSRM_EXPORTS%s',
+            ' /D PHP_EXPORTS /D LIBZEND_EXPORTS /D SAPI_EXPORTS%s',
             $build_dir,
             $source_dir,
             $source_dir,
