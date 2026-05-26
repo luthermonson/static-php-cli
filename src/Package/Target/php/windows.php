@@ -332,6 +332,16 @@ trait windows
             $content
         );
 
+        // Embed SAPI objects are compiled as DLL consumers (dllimport for PHP/Zend APIs).
+        // For our fat static lib, they need direct linkage. Add export defines to CFLAGS_EMBED
+        // so php_embed.obj references symbols directly instead of through __imp_ thunks.
+        $content = preg_replace(
+            '/^CFLAGS_EMBED=(.+)$/m',
+            'CFLAGS_EMBED=$1 /D PHP_EXPORTS /D LIBZEND_EXPORTS /D SAPI_EXPORTS /D TSRM_EXPORTS',
+            $content,
+            1
+        );
+
         // Patch embed lib target to build a REAL static library instead of just an import lib.
         // The default embed target only includes embed SAPI objects and links against php8.lib (import lib).
         // We need to include PHP core objects (PHP_GLOBAL_OBJS) and static extension objects (STATIC_EXT_OBJS)
