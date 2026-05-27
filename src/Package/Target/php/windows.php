@@ -337,7 +337,7 @@ trait windows
         // so php_embed.obj references symbols directly instead of through __imp_ thunks.
         $content = preg_replace(
             '/^CFLAGS_EMBED=(.+)$/m',
-            'CFLAGS_EMBED=$1 /D PHP_EXPORTS /D LIBZEND_EXPORTS /D SAPI_EXPORTS',
+            'CFLAGS_EMBED=$1 /D PHP_EXPORTS /D LIBZEND_EXPORTS /D SAPI_EXPORTS /D TSRM_EXPORTS',
             $content,
             1
         );
@@ -678,18 +678,41 @@ HEADER;
         // Create embed.c test file (Windows version)
         $embed_c = <<<'C_CODE'
 #include <sapi/embed/php_embed.h>
+#include <stdio.h>
 
 int main(int argc, char **argv) {
-    PHP_EMBED_START_BLOCK(argc, argv)
+    fprintf(stderr, "embed: calling php_embed_init\n");
+    fflush(stderr);
 
-    zend_file_handle file_handle;
-    zend_stream_init_filename(&file_handle, "embed.php");
-
-    if (!php_execute_script(&file_handle)) {
-        php_printf("Failed to execute PHP script.\n");
+    if (php_embed_init(argc, &argv) == FAILURE) {
+        fprintf(stderr, "embed: php_embed_init returned FAILURE\n");
+        fflush(stderr);
+        return 1;
     }
+    fprintf(stderr, "embed: init succeeded\n");
+    fflush(stderr);
 
-    PHP_EMBED_END_BLOCK()
+    zend_first_try {
+        zend_file_handle file_handle;
+        zend_stream_init_filename(&file_handle, "embed.php");
+        fprintf(stderr, "embed: executing script\n");
+        fflush(stderr);
+
+        if (!php_execute_script(&file_handle)) {
+            fprintf(stderr, "embed: php_execute_script failed\n");
+            fflush(stderr);
+        }
+    } zend_catch {
+        fprintf(stderr, "embed: zend_catch triggered\n");
+        fflush(stderr);
+    } zend_end_try();
+
+    fprintf(stderr, "embed: calling php_embed_shutdown\n");
+    fflush(stderr);
+    php_embed_shutdown();
+
+    fprintf(stderr, "embed: done\n");
+    fflush(stderr);
     return 0;
 }
 C_CODE;
@@ -718,7 +741,7 @@ C_CODE;
         $include_flags = sprintf(
             '/I"%s" /I"%s\main" /I"%s\Zend" /I"%s\TSRM" /I"%s" ' .
             '/D ZEND_WIN32=1 /D PHP_WIN32=1 /D WIN32 /D _WINDOWS /D WINDOWS=1 /D _MBCS /D _USE_MATH_DEFINES' .
-            ' /D PHP_EXPORTS /D LIBZEND_EXPORTS /D SAPI_EXPORTS%s',
+            ' /D PHP_EXPORTS /D LIBZEND_EXPORTS /D SAPI_EXPORTS /D TSRM_EXPORTS%s',
             $build_dir,
             $source_dir,
             $source_dir,
@@ -727,11 +750,8 @@ C_CODE;
             $zts_define
         );
 
-        // MSVC cl.exe format: compiler flags must come before /link, linker flags after
-        // ldflags contains /LIBPATH which must be after /link
-        // /FORCE:MULTIPLE: in ZTS mode both zend.obj and php_embed.obj (both packed into the fat php8embed.lib) define _tsrm_ls_cache as a __declspec(thread) variable.
         $compile_cmd = sprintf(
-            'cl.exe /nologo /O2 /MT /Z7 %s embed.c /Fe:embed.exe /link /FORCE:MULTIPLE /LIBPATH:"%s\lib" %s %s',
+            'cl.exe /nologo /O2 /MT /Z7 %s embed.c /Fe:embed.exe /link /LIBPATH:"%s\lib" %s %s',
             $include_flags,
             BUILD_ROOT_PATH,
             $config['libs'],
@@ -755,7 +775,7 @@ C_CODE;
         $raw_output = implode('', $output);
         if ($ret !== 0 || trim($raw_output) !== 'hello') {
             throw new ValidationException(
-                'embed failed to run. Error message: ' . $raw_output,
+                sprintf('embed failed to run (exit code %d). Output: %s', $ret, $raw_output),
                 validation_module: 'php-embed run smoke test'
             );
         }
