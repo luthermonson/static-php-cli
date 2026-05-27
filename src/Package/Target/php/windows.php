@@ -348,7 +348,7 @@ trait windows
         // binary under /FORCE:MULTIPLE. Remove it so php_embed.obj uses the core's copy.
         $embed_src = "{$package->getSourceDir()}\\sapi\\embed\\php_embed.c";
         if (file_exists($embed_src)) {
-            FileSystem::replaceFileStr($embed_src, 'TSRMLS_CACHE_DEFINE();', '/* removed for static embed */');
+            FileSystem::replaceFileStr($embed_src, 'ZEND_TSRMLS_CACHE_DEFINE()', '/* removed for static embed */');
         }
 
         // Patch embed lib target to build a REAL static library instead of just an import lib.
