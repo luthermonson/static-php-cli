@@ -684,7 +684,7 @@ int main(int argc, char **argv) {
     fprintf(stderr, "embed: calling php_embed_init\n");
     fflush(stderr);
 
-    if (php_embed_init(argc, &argv) == FAILURE) {
+    if (php_embed_init(argc, argv) == FAILURE) {
         fprintf(stderr, "embed: php_embed_init returned FAILURE\n");
         fflush(stderr);
         return 1;
