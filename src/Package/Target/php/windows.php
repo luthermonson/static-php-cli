@@ -64,7 +64,7 @@ trait windows
         $args[] = $cli ? '--enable-cli=yes' : '--enable-cli=no';
         $args[] = $cgi ? '--enable-cgi=yes' : '--enable-cgi=no';
         $args[] = $micro ? '--enable-micro=yes' : '--enable-micro=no';
-        $args[] = $embed ? '--enable-embed=yes' : '--enable-embed=no';
+        $args[] = $embed ? '--enable-embed=static' : '--enable-embed=no';
 
         // zts
         $args[] = $package->getBuildOption('enable-zts', false) ? '--enable-zts=yes' : '--enable-zts=no';
@@ -226,21 +226,6 @@ trait windows
         $this->deployWindowsBinary($builder, $package, 'php-cgi');
     }
 
-    #[BeforeStage('php', [self::class, 'makeForWindows'])]
-    #[PatchDescription('Define LEXBOR_STATIC for static builds (PHP 8.5+ uri extension)')]
-    public function patchLexborStaticDefine(TargetPackage $package): void
-    {
-        if ($this->getPHPVersionID() < 80500) {
-            return;
-        }
-        $makefile_path = "{$package->getSourceDir()}\\Makefile";
-        $content = FileSystem::readFile($makefile_path);
-        // ext/uri references lexbor headers which default to __declspec(dllimport) on Windows.
-        // LEXBOR_STATIC makes LXB_API expand to nothing, required for static linking.
-        $content = preg_replace('/^CFLAGS_URI=(.+)$/m', 'CFLAGS_URI=$1 /D LEXBOR_STATIC', $content, 1);
-        FileSystem::writeFile($makefile_path, $content);
-    }
-
     #[Stage]
     public function makeForWindows(TargetPackage $package, PackageInstaller $installer): void
     {
@@ -315,7 +300,7 @@ trait windows
     }
 
     #[BeforeStage('php', [self::class, 'makeEmbedForWindows'])]
-    #[PatchDescription('Patch Windows Makefile for embed static library target')]
+    #[PatchDescription('Patch Windows Makefile PHP_LDFLAGS for /MT static CRT')]
     public function patchEmbedTarget(TargetPackage $package): void
     {
         $makefile_path = "{$package->getSourceDir()}\\Makefile";
@@ -331,78 +316,6 @@ trait windows
             'PHP_LDFLAGS=$(DLL_LDFLAGS) /nodefaultlib:msvcrt /nodefaultlib:msvcrtd /def:$(PHPDEF) /ltcg /ignore:4286',
             $content
         );
-
-        // Embed SAPI objects are compiled as DLL consumers (dllimport for PHP/Zend APIs).
-        // For our fat static lib, they need direct linkage. Add export defines to CFLAGS_EMBED
-        // so php_embed.obj references symbols directly instead of through __imp_ thunks.
-        $content = preg_replace(
-            '/^CFLAGS_EMBED=(.+)$/m',
-            'CFLAGS_EMBED=$1 /D PHP_EXPORTS /D LIBZEND_EXPORTS /D SAPI_EXPORTS /D TSRM_EXPORTS',
-            $content,
-            1
-        );
-
-        // In DLL builds each SAPI has its own _tsrm_ls_cache via TSRMLS_CACHE_DEFINE().
-        // In our fat static lib all objects share one binary, so the duplicate TLS definition
-        // from php_embed.c collides with the one in zend.c, producing LNK4006 and a corrupt
-        // binary under /FORCE:MULTIPLE. Remove it so php_embed.obj uses the core's copy.
-        $embed_src = "{$package->getSourceDir()}\\sapi\\embed\\php_embed.c";
-        if (file_exists($embed_src)) {
-            FileSystem::replaceFileStr($embed_src, 'ZEND_TSRMLS_CACHE_DEFINE()', '/* removed for static embed */');
-        }
-
-        // Patch embed lib target to build a REAL static library instead of just an import lib.
-        // The default embed target only includes embed SAPI objects and links against php8.lib (import lib).
-        // We need to include PHP core objects (PHP_GLOBAL_OBJS) and static extension objects (STATIC_EXT_OBJS)
-        // to create a self-contained static library that doesn't require php8.dll at runtime.
-        $major = intdiv($this->getPHPVersionID(), 10000);
-        $embed_lib = "php{$major}embed.lib";
-
-        // Find and replace the embed lib build rule
-        // Actual Makefile format (note the backslash before $(PHPLIB)):
-        // $(BUILD_DIR)\php8embed.lib: $(DEPS_EMBED) $(EMBED_GLOBAL_OBJS) $(BUILD_DIR)\$(PHPLIB) $(BUILD_DIR)\php8embed.lib.res $(BUILD_DIR)\php8embed.lib.manifest
-        // 	@$(MAKE_LIB) /nologo /out:$(BUILD_DIR)\php8embed.lib $(ARFLAGS) $(EMBED_GLOBAL_OBJS_RESP) $(BUILD_DIR)\$(PHPLIB) $(ARFLAGS_EMBED) $(LIBS_EMBED) $(BUILD_DIR)\php8embed.lib.res
-        $lines = explode("\r\n", $content);
-        $new_lines = [];
-        $i = 0;
-        while ($i < count($lines)) {
-            $line = $lines[$i];
-            // Check if this is the embed lib target dependency line (contains the lib name and $(BUILD_DIR)\$(PHPLIB))
-            if (str_contains($line, "\$(BUILD_DIR)\\{$embed_lib}:") && str_contains($line, '$(BUILD_DIR)\$(PHPLIB)')) {
-                // Replace the dependency line
-                // Original: $(BUILD_DIR)\php8embed.lib: $(DEPS_EMBED) $(EMBED_GLOBAL_OBJS) $(BUILD_DIR)\$(PHPLIB) $(BUILD_DIR)\php8embed.lib.res $(BUILD_DIR)\php8embed.lib.manifest
-                // New: $(BUILD_DIR)\php8embed.lib: $(DEPS_EMBED) $(EMBED_GLOBAL_OBJS) $(PHP_GLOBAL_OBJS) $(STATIC_EXT_OBJS) $(ASM_OBJS) $(BUILD_DIR)\php8embed.lib.res $(BUILD_DIR)\php8embed.lib.manifest
-                $new_deps = "\$(BUILD_DIR)\\{$embed_lib}: \$(DEPS_EMBED) \$(EMBED_GLOBAL_OBJS) \$(PHP_GLOBAL_OBJS) \$(STATIC_EXT_OBJS) \$(ASM_OBJS) \$(BUILD_DIR)\\{$embed_lib}.res \$(BUILD_DIR)\\{$embed_lib}.manifest";
-                $new_lines[] = $new_deps;
-                // Skip the original line (we replaced it)
-                ++$i;
-                // Now look for the lib.exe command line (should be the next non-empty line starting with tab)
-                while ($i < count($lines) && trim($lines[$i]) === '') {
-                    $new_lines[] = $lines[$i];
-                    ++$i;
-                }
-                // Replace the lib.exe command to include PHP_GLOBAL_OBJS_RESP and STATIC_EXT_OBJS_RESP
-                // Original: @$(MAKE_LIB) /nologo /out:$(BUILD_DIR)\php8embed.lib $(ARFLAGS) $(EMBED_GLOBAL_OBJS_RESP) $(BUILD_DIR)\$(PHPLIB) $(ARFLAGS_EMBED) $(LIBS_EMBED) $(BUILD_DIR)\php8embed.lib.res
-                // New: @$(MAKE_LIB) /nologo /out:$(BUILD_DIR)\php8embed.lib $(ARFLAGS) $(EMBED_GLOBAL_OBJS_RESP) $(PHP_GLOBAL_OBJS_RESP) $(STATIC_EXT_OBJS_RESP) $(ASM_OBJS) $(STATIC_EXT_LIBS) $(ARFLAGS_EMBED) $(LIBS_EMBED) $(BUILD_DIR)\php8embed.lib.res
-                if ($i < count($lines) && str_contains($lines[$i], '$(MAKE_LIB)')) {
-                    $cmd_line = $lines[$i];
-                    // Remove $(BUILD_DIR)\$(PHPLIB) from the command (note the backslash)
-                    $cmd_line = str_replace(' $(BUILD_DIR)\$(PHPLIB)', '', $cmd_line);
-                    // Add PHP_GLOBAL_OBJS_RESP and STATIC_EXT_OBJS_RESP after EMBED_GLOBAL_OBJS_RESP
-                    $cmd_line = str_replace(
-                        '$(EMBED_GLOBAL_OBJS_RESP)',
-                        '$(EMBED_GLOBAL_OBJS_RESP) $(PHP_GLOBAL_OBJS_RESP) $(STATIC_EXT_OBJS_RESP) $(ASM_OBJS) $(STATIC_EXT_LIBS)',
-                        $cmd_line
-                    );
-                    $new_lines[] = $cmd_line;
-                    ++$i;
-                }
-            } else {
-                $new_lines[] = $line;
-                ++$i;
-            }
-        }
-        $content = implode("\r\n", $new_lines);
 
         FileSystem::writeFile($makefile_path, $content);
     }
