@@ -35,6 +35,24 @@ class opcache extends PhpExtensionPackage
     {
         $version = php::getPHPVersion();
         $php_src = $installer->getTargetPackage('php')->getSourceDir();
+
+        // OPcache refuses to start under SAPI names outside its allowlist
+        // (supported_sapis[] in ZendAccelerator.c) - embed-based runtimes
+        // like ePHPm get "opcache_get_status() => false" even with
+        // opcache.enable=1. Whitelist the "ephpm" SAPI the same way
+        // frankenphp/ngx-php were added upstream. Applies to every PHP
+        // version (8.5 skips the static-build patching below but still
+        // needs this), anchored on "fuzzer" which exists in all of them.
+        $accel = "{$php_src}/ext/opcache/ZendAccelerator.c";
+        $code = @file_get_contents($accel);
+        if ($code !== false && !str_contains($code, '"ephpm"')) {
+            $patched = str_replace('"fuzzer",', '"fuzzer", "ephpm",', $code, $count);
+            if ($count !== 1) {
+                throw new WrongUsageException('ephpm SAPI allowlist patch failed: expected exactly one "fuzzer" anchor in ZendAccelerator.c, found ' . $count);
+            }
+            file_put_contents($accel, $patched);
+        }
+
         if (file_exists("{$php_src}/.opcache_patched")) {
             return false;
         }
