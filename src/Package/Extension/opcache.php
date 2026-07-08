@@ -40,17 +40,20 @@ class opcache extends PhpExtensionPackage
         // (supported_sapis[] in ZendAccelerator.c) - embed-based runtimes
         // like ePHPm get "opcache_get_status() => false" even with
         // opcache.enable=1. Whitelist the "ephpm" SAPI the same way
-        // frankenphp/ngx-php were added upstream. Applies to every PHP
-        // version (8.5 skips the static-build patching below but still
-        // needs this), anchored on "fuzzer" which exists in all of them.
-        $accel = "{$php_src}/ext/opcache/ZendAccelerator.c";
-        $code = @file_get_contents($accel);
-        if ($code !== false && !str_contains($code, '"ephpm"')) {
-            $patched = str_replace('"fuzzer",', '"fuzzer", "ephpm",', $code, $count);
-            if ($count !== 1) {
-                throw new WrongUsageException('ephpm SAPI allowlist patch failed: expected exactly one "fuzzer" anchor in ZendAccelerator.c, found ' . $count);
+        // frankenphp/ngx-php were added upstream. PHP 8.5 removed the
+        // allowlist entirely (any SAPI may use OPcache; only cli/phpdbg
+        // still gate on enable_cli), so the patch applies to < 8.5 only -
+        // anchored on "fuzzer", which exists exactly once in 8.0-8.4.
+        if (php::getPHPVersionID() < 80500) {
+            $accel = "{$php_src}/ext/opcache/ZendAccelerator.c";
+            $code = @file_get_contents($accel);
+            if ($code !== false && !str_contains($code, '"ephpm"')) {
+                $patched = str_replace('"fuzzer",', '"fuzzer", "ephpm",', $code, $count);
+                if ($count !== 1) {
+                    throw new WrongUsageException('ephpm SAPI allowlist patch failed: expected exactly one "fuzzer" anchor in ZendAccelerator.c, found ' . $count);
+                }
+                file_put_contents($accel, $patched);
             }
-            file_put_contents($accel, $patched);
         }
 
         if (file_exists("{$php_src}/.opcache_patched")) {
