@@ -37,22 +37,50 @@ class opcache extends PhpExtensionPackage
         $php_src = $installer->getTargetPackage('php')->getSourceDir();
 
         // OPcache refuses to start under SAPI names outside its allowlist
-        // (supported_sapis[] in ZendAccelerator.c) - embed-based runtimes
-        // like ePHPm get "opcache_get_status() => false" even with
-        // opcache.enable=1. Whitelist the "ephpm" SAPI the same way
-        // frankenphp/ngx-php were added upstream. PHP 8.5 removed the
-        // allowlist entirely (any SAPI may use OPcache; only cli/phpdbg
-        // still gate on enable_cli), so the patch applies to < 8.5 only -
-        // anchored on "fuzzer", which exists exactly once in 8.0-8.4.
+        // (supported_sapis[] in ZendAccelerator.c) - embed-based runtimes get
+        // "opcache_get_status() => false" even with opcache.enable=1, because
+        // "embed" is not in the list. Inject the SAPI names the consumer needs
+        // the same way frankenphp/ngx-php were added upstream.
+        //
+        // SPC_OPCACHE_EXTRA_SAPIS is a comma-separated list. Unset defaults to
+        // "ephpm" (ePHPm builds predate this knob and must keep working
+        // unchanged). Set to the empty string to inject nothing.
+        //
+        // PHP 8.5 removed the allowlist entirely (any SAPI may use OPcache;
+        // only cli/phpdbg still gate on enable_cli), so the patch applies to
+        // < 8.5 only - anchored on "fuzzer", which exists exactly once in
+        // 8.0-8.4.
         if (php::getPHPVersionID() < 80500) {
             $accel = "{$php_src}/ext/opcache/ZendAccelerator.c";
             $code = @file_get_contents($accel);
-            if ($code !== false && !str_contains($code, '"ephpm"')) {
-                $patched = str_replace('"fuzzer",', '"fuzzer", "ephpm",', $code, $count);
-                if ($count !== 1) {
-                    throw new WrongUsageException('ephpm SAPI allowlist patch failed: expected exactly one "fuzzer" anchor in ZendAccelerator.c, found ' . $count);
+            if ($code !== false) {
+                $env = getenv('SPC_OPCACHE_EXTRA_SAPIS');
+                $requested = $env === false
+                    ? ['ephpm']
+                    : array_filter(array_map('trim', explode(',', $env)), fn (string $name) => $name !== '');
+
+                $inject = [];
+                foreach ($requested as $name) {
+                    // The name is spliced into a C string literal, so anything
+                    // outside this set could break the source or inject code.
+                    if (preg_match('/^[A-Za-z0-9._-]+$/', $name) !== 1) {
+                        throw new WrongUsageException("Invalid SAPI name in SPC_OPCACHE_EXTRA_SAPIS: '{$name}' (allowed: letters, digits, dot, dash, underscore)");
+                    }
+                    // Already in supported_sapis[] upstream (cli, fpm-fcgi,
+                    // frankenphp, ...) or injected by an earlier run.
+                    if (!str_contains($code, "\"{$name}\"")) {
+                        $inject[] = $name;
+                    }
                 }
-                file_put_contents($accel, $patched);
+
+                if ($inject !== []) {
+                    $literals = implode('', array_map(fn (string $name) => " \"{$name}\",", $inject));
+                    $patched = str_replace('"fuzzer",', '"fuzzer",' . $literals, $code, $count);
+                    if ($count !== 1) {
+                        throw new WrongUsageException('OPcache SAPI allowlist patch failed: expected exactly one "fuzzer" anchor in ZendAccelerator.c, found ' . $count);
+                    }
+                    file_put_contents($accel, $patched);
+                }
             }
         }
 
