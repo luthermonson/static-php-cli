@@ -8,8 +8,9 @@ openssl:
       prefer-stable: true
     source-mirror:
       type: filelist
-      url: 'https://www.openssl.org/source/'
-      regex: '/href="(?<file>openssl-(?<version>3\.[^"]+)\.tar\.gz)"/'
+      url: 'https://openssl-library.org/source/'
+      regex: '/href="[^"]*\/(?<file>openssl-(?<version>3\.[0-9.]+)\.tar\.gz)"/'
+      download-url: 'https://github.com/openssl/openssl/releases/download/openssl-{version}/{file}'
     metadata:
       license-files: [LICENSE.txt]
       license: OpenSSL
