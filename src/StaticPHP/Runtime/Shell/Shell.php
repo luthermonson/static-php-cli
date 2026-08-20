@@ -160,10 +160,27 @@ abstract class Shell
         if ($console_output) {
             $console_res = STDOUT;
         }
+        $is_windows = PHP_OS_FAMILY === 'Windows';
+        // Children must receive file/console/pipe std handles on Windows.
+        // 'socket' descriptors make msys-based tools abort with
+        // "dup() in/out/err failed" (the msys runtime cannot dup these
+        // socket handles onto std fds), so every git clone spc ran on
+        // Windows failed. Sockets were only used because stream_select()
+        // cannot watch anonymous pipes on Windows; the read loop below
+        // polls non-blocking pipes there instead.
+        // stdin is passed through only when it is a real console. In
+        // CI/service contexts spc's own stdin may be a socket or closed,
+        // and forwarding it hands the child the same unusable handle, so
+        // the child gets the NUL device instead.
+        if ($is_windows && !(defined('STDIN') && is_resource(STDIN) && stream_isatty(STDIN))) {
+            $stdin_descriptor = ['file', 'NUL', 'r'];
+        } else {
+            $stdin_descriptor = ['file', 'php://stdin', 'r'];
+        }
         $descriptors = [
-            0 => ['file', 'php://stdin', 'r'], // stdin
-            1 => PHP_OS_FAMILY === 'Windows' ? ['socket'] : ['pipe', 'w'], // stdout
-            2 => PHP_OS_FAMILY === 'Windows' ? ['socket'] : ['pipe', 'w'], // stderr
+            0 => $stdin_descriptor, // stdin
+            1 => ['pipe', 'w'], // stdout
+            2 => ['pipe', 'w'], // stderr
         ];
         if ($env !== null && $env !== []) {
             // merge current PHP envs
@@ -196,12 +213,10 @@ abstract class Shell
                         // The child has exited, so drain the remaining data to real EOF.
                         // These streams were set non-blocking, and on a non-blocking stream
                         // fread() returns '' when no data happens to be buffered yet, which
-                        // is indistinguishable from EOF. On Windows the descriptors are
-                        // socket pairs, where data the child wrote shortly before exiting
-                        // may not be readable yet - stopping at the first empty read then
-                        // truncates the captured output. A blocking fread() returns '' only
-                        // at EOF, and EOF is guaranteed here because the child has exited
-                        // and its ends of the descriptors are closed.
+                        // is indistinguishable from EOF - stopping at the first empty read
+                        // may truncate the captured output. A blocking fread() returns ''
+                        // only at EOF, and EOF is guaranteed here because the child has
+                        // exited and its ends of the descriptors are closed.
                         stream_set_blocking($pipe, true);
                         while (($chunk = fread($pipe, 8192)) !== false && $chunk !== '') {
                             if ($console_output) {
@@ -235,6 +250,32 @@ abstract class Shell
                     $callback = static::$passthru_callback;
                     $callback();
                 }
+                if ($is_windows) {
+                    // stream_select() cannot watch anonymous pipes on Windows;
+                    // poll both pipes with non-blocking reads instead. Reading
+                    // every iteration keeps the pipe buffers drained so the
+                    // child never blocks on a full pipe.
+                    $got_data = false;
+                    foreach ([$pipes[1], $pipes[2]] as $pipe) {
+                        while (($chunk = fread($pipe, 8192)) !== false && $chunk !== '') {
+                            $got_data = true;
+                            if ($console_output) {
+                                spc_write_log($console_res, $chunk);
+                            }
+                            if ($file_res !== null) {
+                                spc_write_log($file_res, $chunk);
+                            }
+                            if ($capture_output) {
+                                $output_value .= $chunk;
+                            }
+                        }
+                    }
+                    if (!$got_data) {
+                        usleep(50000);
+                    }
+                    continue;
+                }
+
                 $read = [$pipes[1], $pipes[2]];
                 $write = null;
                 $except = null;
