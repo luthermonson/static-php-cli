@@ -17,9 +17,35 @@ class GitHubRelease implements DownloadTypeInterface, ValidatorInterface, CheckU
 
     public const string ASSET_URL = 'https://api.github.com/repos/{repo}/releases/assets/{id}';
 
+    public const string RELEASE_BY_TAG_URL = 'https://api.github.com/repos/{repo}/releases/tags/{tag}';
+
     private string $sha256 = '';
 
     private ?string $version = null;
+
+    /**
+     * Fetch exactly one release by tag.
+     *
+     * Deliberately NOT getGitHubReleases() + a filter. That endpoint lists
+     * releases newest-first with no pagination parameter, so GitHub caps it at
+     * 30: on a repository that ships releases regularly, a fixed tag silently
+     * falls off the end and disappears. It also drops prereleases when
+     * prefer_stable is on. An explicit tag should mean exactly that tag,
+     * regardless of how many releases came after it or how it is flagged, and
+     * this endpoint answers in O(1).
+     */
+    public function getGitHubReleaseByTag(string $name, string $repo, string $tag, int $retries = 0): array
+    {
+        logger()->debug("Fetching {$name} GitHub release {$tag} from {$repo}");
+        $url = str_replace(['{repo}', '{tag}'], [$repo, rawurlencode($tag)], self::RELEASE_BY_TAG_URL);
+        $headers = $this->getGitHubTokenHeaders();
+        $raw = default_shell()->executeCurl($url, headers: $headers, retries: $retries);
+        $data = json_decode($raw ?: '', true);
+        if (!is_array($data) || !isset($data['tag_name'])) {
+            throw new DownloaderException("Failed to get GitHub release '{$tag}' for {$repo} from {$url}");
+        }
+        return $data;
+    }
 
     public function getGitHubReleases(string $name, string $repo, bool $prefer_stable = true, ?string $query = null, int $retries = 0): array
     {
