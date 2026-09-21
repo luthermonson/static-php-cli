@@ -8,9 +8,35 @@ gettext:
     metadata:
       license-files: [gettext-runtime/intl/COPYING.LIB]
       license: LGPL-2.1-or-later
+  # ncurses and libxml2 were `suggests`. They are `depends` so that gettext can
+  # be pre-built.
+  #
+  # A suggested dependency is OPTIONAL: if it happens to be in the build set
+  # gettext links it, otherwise it does not. The same source therefore produces
+  # different binaries depending on what else was being built, which is exactly
+  # why LibraryPackage::packPrebuilt refuses to pack anything whose resolved
+  # tree declares suggests -- one artifact cannot be correct for both cases:
+  #
+  #   The library gettext has lib-suggests, packing [gettext] is not safe, abort !
+  #
+  # That guard is right, and this does not weaken it. It removes the ambiguity
+  # instead: making them required means the artifact's contents are determined
+  # by construction rather than by whatever else happened to be in the build.
+  #
+  # Cost of the change is nil in practice -- a build that wants gettext now
+  # always builds ncurses and libxml2, which every consumer of this fork
+  # already did (both appear in every php-sdk build). A hypothetical build that
+  # wanted gettext WITHOUT them now gets them: slightly more work, never a
+  # wrong binary.
+  #
+  # Why it matters: gettext is the single most expensive library in the set and
+  # the one that scales worst with cores -- measured on the fleet across a
+  # 4-core and a 16-core machine it went 149 s -> 125 s -> 85 s while icu went
+  # 176 s -> 34 s. Throwing hardware at it does not help; not rebuilding it
+  # does. It is 85 s of a 336 s dependency phase, and it was the ONLY library
+  # in that phase that could not be pre-built.
   depends:
     - libiconv
-  suggests:
     - ncurses
     - libxml2
   frameworks:
