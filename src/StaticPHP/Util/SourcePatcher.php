@@ -56,7 +56,7 @@ class SourcePatcher
             . ($detect_reverse ? ' -R' : '')
             . ' < ' . escapeshellarg($patch_arg)
             . ' > ' . (PHP_OS_FAMILY === 'Windows' ? 'NUL' : '/dev/null') . ' 2>&1';
-        exec($detect_cmd, $output, $detect_status);
+        $detect_status = self::execPatchCommand($detect_cmd);
 
         if ($detect_status === 0) {
             // Patch already applied
@@ -69,7 +69,7 @@ class SourcePatcher
             . ($reverse ? ' -R' : '')
             . ' < ' . escapeshellarg($patch_arg);
 
-        exec($apply_cmd, $apply_output, $apply_status);
+        $apply_status = self::execPatchCommand($apply_cmd);
         if ($apply_status !== 0) {
             throw new PatchException($patch_name, "Patch file [{$patch_name}] failed to apply");
         }
@@ -290,5 +290,23 @@ class SourcePatcher
         }
 
         return true;
+    }
+
+    /**
+     * Run a patch command and return its exit code.
+     *
+     * On Windows this goes through the shell layer (proc_open with pipe
+     * descriptors) instead of exec(), whose children inherit spc's own std
+     * handles: msys patch has failed with "dup() in/out/err failed" under
+     * CI/service stdio. The shell layer gives children usable pipe handles
+     * regardless of what spc's own stdio is.
+     */
+    private static function execPatchCommand(string $cmd): int
+    {
+        if (PHP_OS_FAMILY === 'Windows') {
+            return cmd(false)->execWithResult($cmd, false)[0];
+        }
+        exec($cmd, $output, $status);
+        return $status;
     }
 }

@@ -133,7 +133,7 @@ class ArtifactCache
                 'cache_type' => 'git',
                 'dirname' => $download_result->dirname,
                 'extract' => $download_result->extract,
-                'hash' => trim(exec('cd ' . escapeshellarg(DOWNLOAD_PATH . '/' . $download_result->dirname) . ' && ' . SPC_GIT_EXEC . ' rev-parse HEAD')),
+                'hash' => $this->gitRevParseHead(DOWNLOAD_PATH . '/' . $download_result->dirname),
                 'time' => time(),
                 'version' => $download_result->version,
                 'config' => $download_result->config,
@@ -328,11 +328,31 @@ class ArtifactCache
                 is_dir(DOWNLOAD_PATH . '/' . $object['dirname'] . '/.git') &&
                 (!$compare_hash || (
                     isset($object['hash']) &&
-                    trim(exec('cd ' . escapeshellarg(DOWNLOAD_PATH . '/' . $object['dirname']) . ' && ' . SPC_GIT_EXEC . ' rev-parse HEAD')) === $object['hash']
+                    $this->gitRevParseHead(DOWNLOAD_PATH . '/' . $object['dirname']) === $object['hash']
                 )),
             'local' => isset($object['dirname']) &&
                 is_dir($object['dirname']), // local dirname is absolute path
             default => false,
         };
+    }
+
+    /**
+     * Return the HEAD commit hash of a git checkout.
+     *
+     * On Windows this goes through the shell layer (proc_open with pipe
+     * descriptors) instead of exec(), whose children inherit spc's own std
+     * handles: msys git fails with "dup() in/out/err failed" when those are
+     * unusable (CI/service stdio). The shell layer gives children usable
+     * pipe handles regardless of what spc's own stdio is.
+     */
+    private function gitRevParseHead(string $dir): string
+    {
+        $cmd = SPC_GIT_EXEC . ' -C ' . escapeshellarg($dir) . ' rev-parse HEAD';
+        if (PHP_OS_FAMILY === 'Windows') {
+            $result = cmd(false)->execWithResult($cmd, false);
+            return $result[0] === 0 ? trim(implode("\n", $result[1])) : '';
+        }
+        exec($cmd, $output, $status);
+        return $status === 0 ? trim(implode("\n", $output)) : '';
     }
 }
