@@ -40,16 +40,22 @@ class FileList implements DownloadTypeInterface, CheckUpdateInterface
     {
         logger()->debug("Fetching file list from {$config['url']}");
         $page = default_shell()->executeCurl($config['url'], retries: $downloader->getRetry());
-        preg_match_all($config['regex'], $page ?: '', $matches);
-        if (!$matches) {
-            throw new DownloaderException("Failed to get {$name} file list from {$config['url']}");
+        return $this->parseFileList($name, $config, $page ?: '');
+    }
+
+    /**
+     * Parse a fetched file index page and return [filename, version, versions].
+     *
+     * @throws DownloaderException when the regex matches nothing or every match is filtered out as a pre-release
+     */
+    protected function parseFileList(string $name, array $config, string $page): array
+    {
+        preg_match_all($config['regex'], $page, $matches);
+        if (empty($matches['file']) || empty($matches['version'])) {
+            throw new DownloaderException("Failed to get {$name} file list from {$config['url']}: regex matched no files");
         }
         $versions = [];
-        $cnt = count($matches['version']);
-        if ($cnt === 0) {
-            throw new DownloaderException("Failed to get {$name} file list from {$config['url']}: no version parsed");
-        }
-        logger()->debug("Matched {$cnt} versions for {$name}");
+        logger()->debug('Matched ' . count($matches['version']) . " versions for {$name}");
         foreach ($matches['version'] as $i => $version) {
             $lower = strtolower($version);
             foreach (['alpha', 'beta', 'rc', 'pre', 'nightly', 'snapshot', 'dev'] as $beta) {
@@ -58,6 +64,9 @@ class FileList implements DownloadTypeInterface, CheckUpdateInterface
                 }
             }
             $versions[$version] = $matches['file'][$i];
+        }
+        if ($versions === []) {
+            throw new DownloaderException("Failed to get {$name} file list from {$config['url']}: all matched versions were filtered out as pre-releases");
         }
         uksort($versions, 'version_compare');
         $filename = end($versions);
