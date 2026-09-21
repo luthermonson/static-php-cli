@@ -37,7 +37,7 @@ class GitHubRelease implements DownloadTypeInterface, ValidatorInterface, CheckU
     public function getGitHubReleaseByTag(string $name, string $repo, string $tag, int $retries = 0): array
     {
         logger()->debug("Fetching {$name} GitHub release {$tag} from {$repo}");
-        $url = str_replace(['{repo}', '{tag}'], [$repo, rawurlencode($tag)], self::RELEASE_BY_TAG_URL);
+        $url = self::getGitHubApiUrl(str_replace(['{repo}', '{tag}'], [$repo, rawurlencode($tag)], self::RELEASE_BY_TAG_URL));
         $headers = $this->getGitHubTokenHeaders();
         $raw = default_shell()->executeCurl($url, headers: $headers, retries: $retries);
         $data = json_decode($raw ?: '', true);
@@ -50,7 +50,7 @@ class GitHubRelease implements DownloadTypeInterface, ValidatorInterface, CheckU
     public function getGitHubReleases(string $name, string $repo, bool $prefer_stable = true, ?string $query = null, int $retries = 0): array
     {
         logger()->debug("Fetching {$name} GitHub releases from {$repo}");
-        $url = str_replace('{repo}', $repo, self::API_URL);
+        $url = self::getGitHubApiUrl(str_replace('{repo}', $repo, self::API_URL));
         $url .= ($query ?? '');
         $headers = $this->getGitHubTokenHeaders();
         $data2 = default_shell()->executeCurl($url, headers: $headers, retries: $retries);
@@ -75,7 +75,7 @@ class GitHubRelease implements DownloadTypeInterface, ValidatorInterface, CheckU
     public function getLatestGitHubRelease(string $name, string $repo, bool $prefer_stable, string $match_asset, ?string $query = null, int $retries = 0): array
     {
         logger()->debug("Fetching {$name} GitHub release from {$repo}");
-        $url = str_replace('{repo}', $repo, self::API_URL);
+        $url = self::getGitHubApiUrl(str_replace('{repo}', $repo, self::API_URL));
         $url .= ($query ?? '');
         $headers = $this->getGitHubTokenHeaders();
         $data2 = default_shell()->executeCurl($url, headers: $headers, retries: $retries);
@@ -113,7 +113,7 @@ class GitHubRelease implements DownloadTypeInterface, ValidatorInterface, CheckU
         $rel = $this->getLatestGitHubRelease($name, $config['repo'], $config['prefer-stable'] ?? true, $config['match'], $config['query'] ?? null, $downloader->getRetry());
 
         // download file using curl
-        $asset_url = str_replace(['{repo}', '{id}'], [$config['repo'], $rel['id']], self::ASSET_URL);
+        $asset_url = self::getGitHubApiUrl(str_replace(['{repo}', '{id}'], [$config['repo'], $rel['id']], self::ASSET_URL));
         $headers = array_merge(
             $this->getGitHubTokenHeaders(),
             ['Accept: application/octet-stream']

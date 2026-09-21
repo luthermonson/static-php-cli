@@ -25,7 +25,7 @@ class GitHubTarball implements DownloadTypeInterface, CheckUpdateInterface
     public function getGitHubTarballInfo(string $name, string $repo, string $rel_type, bool $prefer_stable = true, ?string $match_url = null, ?string $basename = null, ?string $query = null, int $retries = 0): array
     {
         if ($rel_type === 'releases' && $match_url === null && $query === null && $prefer_stable) {
-            $api_url = str_replace(['{repo}', '{rel_type}'], [$repo, 'releases/latest'], self::API_URL);
+            $api_url = self::getGitHubApiUrl(str_replace(['{repo}', '{rel_type}'], [$repo, 'releases/latest'], self::API_URL));
             $data = default_shell()->executeCurl($api_url, headers: $this->getGitHubTokenHeaders(), retries: $retries);
             $data = json_decode($data ?: '', true);
             if (!is_array($data) || empty($data['tarball_url'])) {
@@ -34,7 +34,7 @@ class GitHubTarball implements DownloadTypeInterface, CheckUpdateInterface
             $rel_url = $data['tarball_url'];
             $this->version = $data['tag_name'] ?? $data['name'] ?? null;
         } else {
-            $api_url = str_replace(['{repo}', '{rel_type}'], [$repo, $rel_type], self::API_URL);
+            $api_url = self::getGitHubApiUrl(str_replace(['{repo}', '{rel_type}'], [$repo, $rel_type], self::API_URL));
             $api_url .= ($query ?? '');
             $data = default_shell()->executeCurl($api_url, headers: $this->getGitHubTokenHeaders(), retries: $retries);
             $data = json_decode($data ?: '', true);
