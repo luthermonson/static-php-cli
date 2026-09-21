@@ -193,6 +193,16 @@ abstract class Shell
                 $status = proc_get_status($process);
                 if (!$status['running']) {
                     foreach ([$pipes[1], $pipes[2]] as $pipe) {
+                        // The child has exited, so drain the remaining data to real EOF.
+                        // These streams were set non-blocking, and on a non-blocking stream
+                        // fread() returns '' when no data happens to be buffered yet, which
+                        // is indistinguishable from EOF. On Windows the descriptors are
+                        // socket pairs, where data the child wrote shortly before exiting
+                        // may not be readable yet - stopping at the first empty read then
+                        // truncates the captured output. A blocking fread() returns '' only
+                        // at EOF, and EOF is guaranteed here because the child has exited
+                        // and its ends of the descriptors are closed.
+                        stream_set_blocking($pipe, true);
                         while (($chunk = fread($pipe, 8192)) !== false && $chunk !== '') {
                             if ($console_output) {
                                 spc_write_log($console_res, $chunk);
