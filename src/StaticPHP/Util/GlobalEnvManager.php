@@ -72,6 +72,8 @@ class GlobalEnvManager
             }
         }
 
+        self::applyProxy();
+
         ToolchainManager::initToolchain();
 
         // apply second time
@@ -134,13 +136,39 @@ class GlobalEnvManager
         }
         // test bison
         if (PHP_OS_FAMILY === 'Darwin') {
-            if ($bison = MacOSUtil::findCommand('bison', ['/opt/homebrew/opt/bison/bin', '/usr/local/opt/bison/bin'])) {
+            if ($bison = MacOSUtil::findCommand('bison', ['/opt/homebrew/opt/bison/bin', '/usr/local/opt/bison/bin', '/opt/local/bin/bison'])) {
                 self::putenv("BISON={$bison}");
             }
-            if ($yacc = MacOSUtil::findCommand('yacc', ['/opt/homebrew/opt/bison/bin', '/usr/local/opt/bison/bin'])) {
+            if ($yacc = MacOSUtil::findCommand('yacc', ['/opt/homebrew/opt/bison/bin', '/usr/local/opt/bison/bin', '/opt/local/bin/yacc'])) {
                 self::putenv("YACC={$yacc}");
             }
         }
+    }
+
+    /**
+     * Apply the proxy settings from the environment variable `SPC_PROXY` to the appropriate environment variables for different tools (curl, git, Go toolchain).
+     */
+    private static function applyProxy(): void
+    {
+        $proxy = trim(getenv('SPC_PROXY') ?: '');
+        if ($proxy === '') {
+            return;
+        }
+
+        foreach (['ALL_PROXY', 'all_proxy'] as $name) {
+            self::putenv("{$name}={$proxy}");
+        }
+
+        // apply go proxy
+        $goproxy = preg_replace('#^socks5h://#i', 'socks5://', $proxy);
+        foreach (['HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy'] as $name) {
+            self::putenv("{$name}={$goproxy}");
+        }
+
+        spc_add_log_filter($proxy);
+        spc_add_log_filter($goproxy);
+
+        logger()->debug('Detected SPC_PROXY, applied to ALL_PROXY, all_proxy, HTTP_PROXY, HTTPS_PROXY, http_proxy, https_proxy');
     }
 
     private static function readIniFile(): array

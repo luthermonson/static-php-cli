@@ -45,12 +45,16 @@ class SourcePatcher
             file_put_contents(SOURCE_PATH . "/{$filename}", file_get_contents($patch_file));
             $patch_str = FileSystem::convertPath(SOURCE_PATH . "/{$filename}");
         }
+        $patch_cwd = FileSystem::convertPath($cwd);
+        $patch_arg = $patch_str;
 
         // Detect if patch is already applied (reverse detection)
         $detect_reverse = !$reverse;
-        $detect_cmd = 'cd ' . escapeshellarg($cwd) . ' && '
-            . (PHP_OS_FAMILY === 'Windows' ? 'type' : 'cat') . ' ' . escapeshellarg($patch_str)
-            . ' | patch --dry-run -p1 -s -f ' . ($detect_reverse ? '-R' : '')
+        $cd_cmd = (PHP_OS_FAMILY === 'Windows' ? 'cd /d ' : 'cd ') . escapeshellarg($patch_cwd);
+        $detect_cmd = $cd_cmd
+            . ' && patch --binary --dry-run -p1 -s -f'
+            . ($detect_reverse ? ' -R' : '')
+            . ' < ' . escapeshellarg($patch_arg)
             . ' > ' . (PHP_OS_FAMILY === 'Windows' ? 'NUL' : '/dev/null') . ' 2>&1';
         $detect_status = self::execPatchCommand($detect_cmd);
 
@@ -60,9 +64,10 @@ class SourcePatcher
         }
 
         // Apply patch
-        $apply_cmd = 'cd ' . escapeshellarg($cwd) . ' && '
-            . (PHP_OS_FAMILY === 'Windows' ? 'type' : 'cat') . ' ' . escapeshellarg($patch_str)
-            . ' | patch -p1 ' . ($reverse ? '-R' : '');
+        $apply_cmd = $cd_cmd
+            . ' && patch --binary -p1'
+            . ($reverse ? ' -R' : '')
+            . ' < ' . escapeshellarg($patch_arg);
 
         $apply_status = self::execPatchCommand($apply_cmd);
         if ($apply_status !== 0) {
@@ -168,6 +173,9 @@ class SourcePatcher
      */
     public static function patchMicroPhar(int $version_id): void
     {
+        if (file_exists(SOURCE_PATH . '/php-src/ext/phar/phar.c.bak')) {
+            return;
+        }
         FileSystem::backupFile(SOURCE_PATH . '/php-src/ext/phar/phar.c');
         FileSystem::replaceFileStr(
             SOURCE_PATH . '/php-src/ext/phar/phar.c',
@@ -193,6 +201,12 @@ class SourcePatcher
 
     public static function unpatchMicroPhar(): void
     {
+        // Tolerate a missing .bak: both drivers call this, and the first restore
+        // consumes the backup. Without this guard the second call throws
+        // "Cannot find bak file". No .bak means the source is already pristine.
+        if (!file_exists(SOURCE_PATH . '/php-src/ext/phar/phar.c.bak')) {
+            return;
+        }
         FileSystem::restoreBackupFile(SOURCE_PATH . '/php-src/ext/phar/phar.c');
     }
 
@@ -234,6 +248,22 @@ class SourcePatcher
         // $ver = "{$match[1]}.{$match[2]}";
 
         $major_ver = $match[1] . $match[2];
+
+        // Official minimal source backports for the EOL branches, fixing
+        // CVE-2026-109618 and CVE-2026-109619. Patched 8.2+ releases
+        // (8.2.35, 8.3.36, 8.4.27, 8.5.12 and later) already contain the
+        // complete fix, so only 7.4, 8.0 and 8.1 use these backports.
+        $security_backport = match ($major_ver) {
+            '74' => 'php2shell_74.patch',
+            '80' => 'php2shell_80.patch',
+            '81' => 'php2shell_81.patch',
+            default => null,
+        };
+        if ($security_backport !== null) {
+            logger()->info("Patching PHP {$match[1]}.{$match[2]} with security backport {$security_backport}");
+            self::patchFile("php-src-patches/{$security_backport}", $php_package->getSourceDir());
+        }
+
         if ($major_ver === '74') {
             return false;
         }
@@ -249,13 +279,17 @@ class SourcePatcher
         $spc_micro_patches = array_filter($spc_micro_patches, fn ($item) => trim((string) $item) !== '');
         $patch_list = $spc_micro_patches;
         $patches = [];
-        $serial = ['80', '81', '82', '83', '84', '85'];
+        $serial = ['80', '81', '82', '83', '84', '85', '86'];
+        $start = array_search($major_ver, $serial, true);
+        if ($start === false) {
+            $start = count($serial) - 1;
+        }
         foreach ($patch_list as $patchName) {
             if (file_exists("{$patch_dir}/{$patchName}.patch")) {
                 $patches[] = "{$patch_dir}/{$patchName}.patch";
                 continue;
             }
-            for ($i = array_search($major_ver, $serial, true); $i >= 0; --$i) {
+            for ($i = $start; $i >= 0; --$i) {
                 $tryMajMin = $serial[$i];
                 if (!file_exists("{$patch_dir}/{$patchName}_{$tryMajMin}.patch")) {
                     continue;

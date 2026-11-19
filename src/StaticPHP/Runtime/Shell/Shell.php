@@ -114,8 +114,8 @@ abstract class Shell
         if (!$this->enable_log_file) {
             return;
         }
-        // write executed command to log file using spc_write_log
-        $log_file = fopen(SPC_SHELL_LOG, 'a');
+        // write executed command to log file using spc_write_log (shared handle, see spc_log_stream)
+        $log_file = spc_log_stream(SPC_SHELL_LOG);
         spc_write_log($log_file, "\n>>>>>>>>>>>>>>>>>>>>>>>>>> [" . date('Y-m-d H:i:s') . "]\n");
         spc_write_log($log_file, "> Executing command: {$cmd}\n");
         // get the backtrace to find the file and line number
@@ -154,11 +154,8 @@ abstract class Shell
     ): array {
         $file_res = null;
         if ($this->enable_log_file) {
-            // write executed command to the log file using spc_write_log
-            $file_res = fopen(SPC_SHELL_LOG, 'a');
-        }
-        if ($console_output) {
-            $console_res = STDOUT;
+            // write executed command to the log file using spc_write_log (shared handle, see spc_log_stream)
+            $file_res = spc_log_stream(SPC_SHELL_LOG);
         }
         $is_windows = PHP_OS_FAMILY === 'Windows';
         // Children must receive file/console/pipe std handles on Windows.
@@ -205,30 +202,38 @@ abstract class Shell
             // fclose($pipes[0]);
             stream_set_blocking($pipes[1], false);
             stream_set_blocking($pipes[2], false);
+            $drain = function ($pipe) use ($console_output, $file_res, $capture_output, &$output_value): void {
+                while (($chunk = fread($pipe, 8192)) !== false && $chunk !== '') {
+                    if ($console_output) {
+                        spc_write_log(STDOUT, $chunk);
+                    }
+                    if ($file_res !== null) {
+                        spc_write_log($file_res, $chunk);
+                    }
+                    if ($capture_output) {
+                        $output_value .= $chunk;
+                    }
+                }
+            };
 
             while (true) {
                 $status = proc_get_status($process);
                 if (!$status['running']) {
-                    foreach ([$pipes[1], $pipes[2]] as $pipe) {
-                        // The child has exited, so drain the remaining data to real EOF.
-                        // These streams were set non-blocking, and on a non-blocking stream
-                        // fread() returns '' when no data happens to be buffered yet, which
-                        // is indistinguishable from EOF - stopping at the first empty read
-                        // may truncate the captured output. A blocking fread() returns ''
-                        // only at EOF, and EOF is guaranteed here because the child has
-                        // exited and its ends of the descriptors are closed.
-                        stream_set_blocking($pipe, true);
-                        while (($chunk = fread($pipe, 8192)) !== false && $chunk !== '') {
-                            if ($console_output) {
-                                spc_write_log($console_res, $chunk);
-                            }
-                            if ($file_res !== null) {
-                                spc_write_log($file_res, $chunk);
-                            }
-                            if ($capture_output) {
-                                $output_value .= $chunk;
+                    // Exit does not mean all output has arrived: on Windows the last bytes can still be in
+                    // flight on the socket, and a grandchild may still write to the inherited handle.
+                    // Read until EOF, bounded in case a grandchild keeps the handle open.
+                    $open = [$pipes[1], $pipes[2]];
+                    $deadline = microtime(true) + 5;
+                    while ($open !== [] && microtime(true) < $deadline) {
+                        $read = $open;
+                        $write = null;
+                        $except = null;
+                        if (stream_select($read, $write, $except, 0, 100000)) {
+                            foreach ($read as $pipe) {
+                                $drain($pipe);
                             }
                         }
+                        $open = array_filter($open, fn ($pipe) => !feof($pipe));
                     }
                     // check exit code
                     if ($throw_on_error && $status['exitcode'] !== 0) {
@@ -288,17 +293,7 @@ abstract class Shell
 
                 if ($ready > 0) {
                     foreach ($read as $pipe) {
-                        while (($chunk = fread($pipe, 8192)) !== false && $chunk !== '') {
-                            if ($console_output) {
-                                spc_write_log($console_res, $chunk);
-                            }
-                            if ($file_res !== null) {
-                                spc_write_log($file_res, $chunk);
-                            }
-                            if ($capture_output) {
-                                $output_value .= $chunk;
-                            }
-                        }
+                        $drain($pipe);
                     }
                 }
             }
@@ -314,9 +309,7 @@ abstract class Shell
             }
             fclose($pipes[1]);
             fclose($pipes[2]);
-            if ($file_res !== null) {
-                fclose($file_res);
-            }
+            // $file_res is a shared, process-wide handle (see spc_log_stream); do not close it here.
             proc_close($process);
         }
     }

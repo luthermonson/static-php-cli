@@ -11,6 +11,7 @@ use StaticPHP\Package\LibraryPackage;
 use StaticPHP\Package\PackageBuilder;
 use StaticPHP\Package\PackageInstaller;
 use StaticPHP\Package\TargetPackage;
+use StaticPHP\Package\ToolPackage;
 use StaticPHP\Runtime\Shell\UnixShell;
 use StaticPHP\Runtime\SystemTarget;
 use StaticPHP\Util\FileSystem;
@@ -40,7 +41,7 @@ class UnixCMakeExecutor extends Executor
 
     protected PackageInstaller $installer;
 
-    public function __construct(protected LibraryPackage $package, ?PackageInstaller $installer = null)
+    public function __construct(protected LibraryPackage|ToolPackage $package, ?PackageInstaller $installer = null)
     {
         parent::__construct($package);
         if ($installer !== null) {
@@ -135,7 +136,7 @@ class UnixCMakeExecutor extends Executor
     /**
      * Add configure args.
      */
-    public function addConfigureArgs(...$args): static
+    public function addConfigureArgs(string ...$args): static
     {
         $this->configure_args = [...$this->configure_args, ...$args];
         return $this;
@@ -144,7 +145,7 @@ class UnixCMakeExecutor extends Executor
     /**
      * Remove some configure args, to bypass the configure option checking for some libs.
      */
-    public function removeConfigureArgs(...$args): static
+    public function removeConfigureArgs(string ...$args): static
     {
         $this->ignore_args = [...$this->ignore_args, ...$args];
         return $this;
@@ -228,8 +229,15 @@ class UnixCMakeExecutor extends Executor
             "-DCMAKE_TOOLCHAIN_FILE={$this->makeCmakeToolchainFile()}",
         ];
 
-        // EXE linker flags: base system libs + framework flags for target packages
-        $exeLinkerFlags = SystemTarget::getRuntimeLibs();
+        // EXE linker flags: framework flags for target packages (Darwin). On Linux the
+        // runtime libs (-ldl & co.) are NOT passed here: CMake puts EXE_LINKER_FLAGS before
+        // the objects/archives, where -Wl,--as-needed (Debian gcc default, and our own
+        // LDFLAGS) discards them and breaks try_compile probes linking static archives that
+        // need them (curl's SSL_set_quic_tls_cbs check vs libcrypto.a needing dlopen on
+        // glibc < 2.34). They go into the toolchain file as CMAKE_<LANG>_STANDARD_LIBRARIES
+        // instead, which cmake appends AFTER the objects — correct order, as-needed intact,
+        // and the toolchain file is re-evaluated inside every try_compile.
+        $exeLinkerFlags = SystemTarget::getTargetOS() === 'Linux' ? '' : SystemTarget::getRuntimeLibs();
         if ($this->package instanceof TargetPackage && SystemTarget::getTargetOS() === 'Darwin') {
             $resolvedNames = array_keys($this->installer->getResolvedPackages());
             $resolvedNames[] = $this->package->getName();
@@ -308,6 +316,21 @@ CMAKE;
             $ranlib = getenv('SPC_DEFAULT_RANLIB') ?: (getenv('RANLIB') ?: 'ranlib');
             $toolchain .= "\nSET(CMAKE_AR \"{$ar}\")";
             $toolchain .= "\nSET(CMAKE_RANLIB \"{$ranlib}\")";
+            // Runtime libs as standard libraries: appended after objects/archives on every
+            // link line (incl. try_compile probes), so -Wl,--as-needed keeps the ones that
+            // are actually referenced.
+            $runtimeLibs = SystemTarget::getRuntimeLibs();
+            if ($runtimeLibs !== '') {
+                $toolchain .= "\nset(CMAKE_C_STANDARD_LIBRARIES_INIT \"{$runtimeLibs}\")";
+                $toolchain .= "\nset(CMAKE_CXX_STANDARD_LIBRARIES_INIT \"{$runtimeLibs}\")";
+            }
+        }
+        // Homebrew on Intel macOS installs into /usr/local, which sits on the compiler's
+        // default search path, so find_* resolves host headers ahead of the ones spc
+        // installed in buildroot and packages end up compiled against them (issue #1289).
+        // Ignoring the prefix keeps cmake's searches inside the buildroot on Darwin.
+        if (PHP_OS_FAMILY === 'Darwin') {
+            $toolchain .= "\nif(CMAKE_VERSION VERSION_GREATER_EQUAL 3.23)\n  set(CMAKE_IGNORE_PREFIX_PATH \"/usr/local\")\nendif()";
         }
         FileSystem::writeFile(SOURCE_PATH . '/toolchain.cmake', $toolchain);
         return $created = realpath(SOURCE_PATH . '/toolchain.cmake');

@@ -35,25 +35,35 @@ class curl
     #[BuildFor('Windows')]
     public function buildWin(LibraryPackage $lib): void
     {
+        $lib_dir = str_replace('\\', '/', $lib->getLibDir());
+        $zstd_lib = "{$lib_dir}/zstd_static.lib";
+        $extra_libs = "{$lib_dir}/libcrypto.lib {$lib_dir}/libssl.lib ws2_32.lib gdi32.lib advapi32.lib crypt32.lib user32.lib";
         WindowsCMakeExecutor::create($lib)
             ->optionalPackage('zstd', ...cmake_boolean_args('CURL_ZSTD'))
             ->optionalPackage('brotli', ...cmake_boolean_args('CURL_BROTLI'))
             ->addConfigureArgs(
-                '-DBUILD_CURL_EXE=OFF',
-                '-DZSTD_LIBRARY=' . BUILD_LIB_PATH . '\\zstd_static.lib',
+                '-DBUILD_CURL_EXE=ON',
+                '-DCMAKE_C_STANDARD_LIBRARIES=' . escapeshellarg($extra_libs),
+                '-DZSTD_LIBRARY=' . escapeshellarg($zstd_lib),
                 '-DBUILD_TESTING=OFF',
                 '-DBUILD_EXAMPLES=OFF',
+                '-DBUILD_LIBCURL_DOCS=OFF',
+                '-DENABLE_CURL_MANUAL=OFF',
                 '-DUSE_LIBIDN2=OFF',
                 '-DCURL_USE_LIBPSL=OFF',
-                '-DUSE_WINDOWS_SSPI=ON',
-                '-DCURL_USE_SCHANNEL=ON',
-                '-DCURL_USE_OPENSSL=OFF',
                 '-DCURL_ENABLE_SSL=ON',
                 '-DUSE_NGHTTP2=ON',
                 '-DSHARE_LIB_OBJECT=OFF',
                 '-DCURL_USE_LIBSSH2=ON',
                 '-DENABLE_IPV6=ON',
-                '-DOPENSSL_ROOT_DIR=' . BUILD_ROOT_PATH,
+                '-DCURL_WINDOWS_SSPI=ON',
+                '-DCURL_USE_SCHANNEL=OFF',
+                '-DCURL_USE_OPENSSL=ON',
+                '-DCURL_CA_NATIVE=ON',
+                '-DCURL_CA_BUNDLE=none',
+                '-DCURL_CA_PATH=none',
+                '-DOPENSSL_ROOT_DIR=' . escapeshellarg(str_replace('\\', '/', BUILD_ROOT_PATH)),
+                '-DOPENSSL_USE_STATIC_LIBS=ON',
             )
             ->build();
         // move libcurl.lib to libcurl_a.lib
@@ -82,6 +92,9 @@ class curl
             ->addConfigureArgs(
                 '-DBUILD_CURL_EXE=ON',
                 '-DBUILD_LIBCURL_DOCS=OFF',
+                '-DBUILD_TESTING=OFF',
+                '-DBUILD_EXAMPLES=OFF',
+                '-DENABLE_CURL_MANUAL=OFF',
                 '-DOPENSSL_ROOT_DIR=' . BUILD_ROOT_PATH,
             )
             ->build();
@@ -94,6 +107,9 @@ class curl
         if (str_contains(FileSystem::readFile($pc_path), '-lgssapi_krb5')) {
             FileSystem::replaceFileRegex($pc_path, '/-lcom_err$/m', '-lcom_err -lkrb5support');
         }
+        // FindThreads can put '-lpthread' into INTERFACE_LINK_LIBRARIES; curl's pc generator
+        // prepends '-l' to each entry, producing '-l-lpthread'. Strip the extra '-l'.
+        FileSystem::replaceFileRegex($pc_path, '/-l(-l\S+)/', '$1');
         shell()->cd("{$lib->getLibDir()}/cmake/CURL/")
             ->exec("sed -ie 's|\"/lib/libcurl.a\"|\"{$lib->getLibDir()}/libcurl.a\"|g' CURLTargets-release.cmake");
 

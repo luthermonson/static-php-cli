@@ -24,6 +24,10 @@ class ConfigValidator
         'lang' => ConfigType::STRING,
         'frameworks' => ConfigType::LIST_ARRAY, // @
 
+        // build-time tool dependency declaration (resolved independently of the library
+        // dependency graph, see PackageInstaller::collectRequiredTools())
+        'tools' => ConfigType::LIST_ARRAY, // @
+
         // php-extension type fields
         'php-extension' => ConfigType::ASSOC_ARRAY,
         'zend-extension' => ConfigType::BOOL,
@@ -44,6 +48,12 @@ class ConfigValidator
         'path' => ConfigType::LIST_ARRAY, // @
         'env' => ConfigType::ASSOC_ARRAY, // @
         'append-env' => ConfigType::ASSOC_ARRAY, // @
+
+        // tool type fields (nested under 'tool' key)
+        'tool' => ConfigType::ASSOC_ARRAY,
+        'provides' => ConfigType::LIST_ARRAY,
+        'binary-subdir' => ConfigType::STRING,
+        'install-root' => ConfigType::STRING,
     ];
 
     public const array PACKAGE_FIELDS = [
@@ -56,6 +66,9 @@ class ConfigValidator
         'lang' => false,
         'frameworks' => false, // @
 
+        // build-time tool dependency declaration
+        'tools' => false, // @
+
         // php-extension type fields
         'php-extension' => false,
 
@@ -67,6 +80,9 @@ class ConfigValidator
         'path' => false, // @
         'env' => false, // @
         'append-env' => false, // @
+
+        // tool fields (nested object)
+        'tool' => false,
     ];
 
     public const array SUFFIX_ALLOWED_FIELDS = [
@@ -78,6 +94,7 @@ class ConfigValidator
         'path',
         'env',
         'append-env',
+        'tools',
     ];
 
     public const array PHP_EXTENSION_FIELDS = [
@@ -92,6 +109,12 @@ class ConfigValidator
         'os' => false,
     ];
 
+    public const array TOOL_FIELDS = [
+        'provides' => true,
+        'binary-subdir' => false,
+        'install-root' => false,
+    ];
+
     public const array ARTIFACT_TYPE_FIELDS = [ // [required_fields, optional_fields]
         'filelist' => [['url', 'regex'], ['extract', 'download-url']],
         'git' => [['url'], ['extract', 'submodules', 'rev', 'regex']],
@@ -101,10 +124,10 @@ class ConfigValidator
         'url' => [['url'], ['filename', 'extract', 'version']],
         'bitbuckettag' => [['repo'], ['extract']],
         'local' => [['dirname'], ['extract']],
-        'pie' => [['repo'], ['extract']],
+        'pie' => [['repo'], ['extract', 'prefer-stable']],
         'pecl' => [['name'], ['extract', 'prefer-stable']],
         'php-release' => [['domain'], ['extract']],
-        'custom' => [[], ['func']],
+        'custom' => [[], ['func', 'base-url']],
     ];
 
     /**
@@ -220,8 +243,8 @@ class ConfigValidator
             $fields = self::SUFFIX_ALLOWED_FIELDS;
             self::validateSuffixAllowedFields($name, $pkg, $fields, $suffixes);
 
-            // check if "library|target" package has artifact field for target and library types
-            if (in_array($pkg['type'], ['target', 'library']) && !isset($pkg['artifact'])) {
+            // check if "library|target|tool" package has artifact field
+            if (in_array($pkg['type'], ['target', 'library', 'tool']) && !isset($pkg['artifact'])) {
                 throw new ValidationException("Package [{$name}] in {$config_file_name} of type '{$pkg['type']}' must have an 'artifact' field");
             }
 
@@ -233,6 +256,11 @@ class ConfigValidator
             // check if "php-extension" package has php-extension specific fields and validate inside
             if ($pkg['type'] === 'php-extension') {
                 self::validatePhpExtensionFields($name, $pkg);
+            }
+
+            // check if "tool" package has tool specific fields and validate inside
+            if ($pkg['type'] === 'tool') {
+                self::validateToolFields($name, $pkg);
             }
 
             // check for unknown fields
@@ -297,8 +325,8 @@ class ConfigValidator
                 throw new ValidationException("Artifact source object of type '{$type}' must have required field '{$field}'");
             }
         }
-        // check for unknown fields
-        $allowed_fields = array_merge(['type'], $required_fields, $optional_fields);
+        // check for unknown fields ('source-root': optional build source root subdir, applies to any type)
+        $allowed_fields = array_merge(['type', 'source-root'], $required_fields, $optional_fields);
         self::validateNoInvalidFields('artifact object', $item_name, $data, $allowed_fields);
     }
 
@@ -395,6 +423,29 @@ class ConfigValidator
         }
         // check for unknown fields in php-extension
         self::validateNoInvalidFields('php-extension', $name, $pkg['php-extension'], array_keys(self::PHP_EXTENSION_FIELDS));
+    }
+
+    /**
+     * Validate tool specific fields for tool package type.
+     */
+    private static function validateToolFields(int|string $name, mixed $pkg): void
+    {
+        if (!isset($pkg['tool'])) {
+            throw new ValidationException("Package {$name} of type 'tool' must have a 'tool' field");
+        }
+        if (!is_assoc_array($pkg['tool'])) {
+            throw new ValidationException("Package {$name} [tool] must be an object");
+        }
+        foreach (self::TOOL_FIELDS as $field => $required) {
+            if ($required && !isset($pkg['tool'][$field])) {
+                throw new ValidationException("Package {$name} [tool] must have required field [{$field}]");
+            }
+            if (isset($pkg['tool'][$field])) {
+                self::validatePackageFieldType($field, $pkg['tool'][$field], $name);
+            }
+        }
+        // check for unknown fields in tool
+        self::validateNoInvalidFields('tool', $name, $pkg['tool'], array_keys(self::TOOL_FIELDS));
     }
 
     private static function validateNoInvalidFields(string $config_type, int|string $item_name, mixed $item_content, array $allowed_fields): void

@@ -12,7 +12,6 @@ use StaticPHP\Package\PackageInstaller;
 use StaticPHP\Runtime\SystemTarget;
 use StaticPHP\Toolchain\ToolchainManager;
 use StaticPHP\Util\FileSystem;
-use StaticPHP\Util\GlobalEnvManager;
 use StaticPHP\Util\System\WindowsUtil;
 
 #[OptionalCheck([self::class, 'optional'])]
@@ -54,32 +53,22 @@ class WindowsToolCheck
         return CheckResult::ok();
     }
 
-    #[CheckItem('if php-sdk-binary-tools are downloaded', limit_os: 'Windows', level: 996)]
-    public function checkSDK(): ?CheckResult
+    #[CheckItem('if msys2-build-essentials is installed', limit_os: 'Windows', level: 996)]
+    public function checkMsys2(): ?CheckResult
     {
-        if (!file_exists(getenv('PHP_SDK_PATH') . DIRECTORY_SEPARATOR . 'phpsdk-starter.bat')) {
-            return CheckResult::fail('php-sdk-binary-tools not downloaded', 'install-php-sdk');
+        $marker = PKG_ROOT_PATH . '\msys2-build-essentials\.spc-msys2-initialized';
+        if (!file_exists($marker)) {
+            return CheckResult::fail('msys2-build-essentials not installed', 'install-msys2-build-essentials');
         }
-        return CheckResult::ok(getenv('PHP_SDK_PATH'));
+        return CheckResult::ok(PKG_ROOT_PATH . '\msys2-build-essentials\msys64');
     }
 
-    #[CheckItem('if nasm installed', level: 995)]
-    public function checkNasm(): ?CheckResult
+    #[CheckItem('if 7za.exe is installed', limit_os: 'Windows', level: 999)]
+    public function check7zaWin(): ?CheckResult
     {
-        if (($a = WindowsUtil::findCommand('nasm.exe')) === null) {
-            return CheckResult::fail('nasm.exe not found in path.', 'install-nasm');
-        }
-        return CheckResult::ok($a);
-    }
-
-    #[CheckItem('if perl(strawberry) installed', limit_os: 'Windows', level: 994)]
-    public function checkPerl(): ?CheckResult
-    {
-        if (($path = WindowsUtil::findCommand('perl.exe')) === null) {
-            return CheckResult::fail('perl not found in path.', 'install-perl');
-        }
-        if (!str_contains(implode('', cmd()->execWithResult(quote($path) . ' -v', false)[1]), 'MSWin32')) {
-            return CheckResult::fail($path . ' is not built for msvc.', 'install-perl');
+        $path = FileSystem::convertPath(PKG_ROOT_PATH . '\bin\7za.exe');
+        if (!file_exists($path)) {
+            return CheckResult::fail('7za.exe not found', 'install-7za-win');
         }
         return CheckResult::ok($path);
     }
@@ -102,31 +91,20 @@ class WindowsToolCheck
         return CheckResult::ok();
     }
 
-    #[FixItem('install-perl')]
-    public function installPerl(): bool
+    #[FixItem('install-msys2-build-essentials')]
+    public function installMsys2(): bool
     {
-        $installer = new PackageInstaller();
-        $installer->addInstallPackage('strawberry-perl');
-        $installer->run(true);
-        GlobalEnvManager::addPathIfNotExists(PKG_ROOT_PATH . '\strawberry-perl');
-        return true;
-    }
-
-    #[FixItem('install-php-sdk')]
-    public function installSDK(): bool
-    {
-        FileSystem::removeDir(getenv('PHP_SDK_PATH'));
         $installer = new PackageInstaller(interactive: false);
-        $installer->addInstallPackage('php-sdk-binary-tools');
+        $installer->addInstallPackage('msys2-build-essentials');
         $installer->run(true);
         return true;
     }
 
-    #[FixItem('install-nasm')]
-    public function installNasm(): bool
+    #[FixItem('install-7za-win')]
+    public function install7zaWin(): bool
     {
         $installer = new PackageInstaller(interactive: false);
-        $installer->addInstallPackage('nasm');
+        $installer->addInstallPackage('7za-win');
         $installer->run(true);
         return true;
     }

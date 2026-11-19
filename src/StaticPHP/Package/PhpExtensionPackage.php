@@ -60,6 +60,54 @@ class PhpExtensionPackage extends Package
         return parent::getSourceDir();
     }
 
+    /**
+     * Directory the extension is actually compiled in; build-stage patches and
+     * validations must target this path to hit the tree being compiled.
+     * For in-tree builds (static, or shared with build-with-php) this is the
+     * source present in php-src/ext: a dir bundled with php-src (e.g. zip, or
+     * imap on PHP < 8.4), or the link (Unix) / junction (Windows, copy as
+     * fallback) placed by the php target's sync step.
+     * For shared (phpize) builds this equals getSourceRoot().
+     */
+    public function getBuildDir(): string
+    {
+        $path = SOURCE_PATH . '/php-src/ext/' . $this->getExtensionName();
+        if (($this->isBuildStatic() || $this->isBuildWithPhp()) && $this->hasConfigureScript($path)) {
+            return $path;
+        }
+        if ($this->getArtifact() === null) {
+            return $this->getSourceDir();
+        }
+        return $this->getSourceRoot();
+    }
+
+    /**
+     * Whether a directory contains a buildable in-tree extension source.
+     *
+     * Some php-src releases keep a leftover directory for an unbundled extension
+     * without its configure script (e.g. ext/imap/tests in PHP 8.4.27 / 8.5.12),
+     * which must not shadow the extension artifact during in-tree builds.
+     */
+    public function hasConfigureScript(string $path): bool
+    {
+        return is_dir($path) && (is_file("{$path}/config.m4") || is_file("{$path}/config.w32"));
+    }
+
+    /**
+     * Root of the buildable artifact source tree: equals getSourceDir() unless the
+     * artifact declares source.source-root (e.g. a PIE package whose config.m4
+     * lives in an ext/ subdir). This is what the php target links/junctions into
+     * php-src/ext/{name} before buildconf, and where shared (phpize) builds run;
+     * use getBuildDir() for the tree actually being compiled.
+     */
+    public function getSourceRoot(): string
+    {
+        if ($this->getArtifact() === null) {
+            return $this->getSourceDir();
+        }
+        return parent::getSourceRoot();
+    }
+
     public function getExtensionName(): string
     {
         return str_replace('ext-', '', $this->getName());
@@ -275,7 +323,7 @@ class PhpExtensionPackage extends Package
             $compiler_extra = trim($compiler_extra . ' -lcompiler_rt');
             GlobalEnvManager::putenv("SPC_COMPILER_EXTRA={$compiler_extra}");
         }
-        $config = (new SPCConfigUtil())->getExtensionConfig($this);
+        $config = (new SPCConfigUtil())->configForResolvedBuild([$this->getName()], $this->getInstaller());
         [$staticLibs, $sharedLibs] = $this->splitLibsIntoStaticAndShared($config['libs']);
         $preStatic = PHP_OS_FAMILY === 'Darwin' ? '' : '-Wl,--start-group ';
         $postStatic = PHP_OS_FAMILY === 'Darwin' ? '' : ' -Wl,--end-group ';
@@ -286,8 +334,8 @@ class PhpExtensionPackage extends Package
         }
         return [
             'CFLAGS' => $config['cflags'],
-            'CXXFLAGS' => $config['cflags'],
-            'LDFLAGS' => $ldflags,
+            'CXXFLAGS' => $config['cxxflags'],
+            'LDFLAGS' => $config['ldflags'],
             'LIBS' => clean_spaces("{$preStatic} {$staticLibs} {$postStatic} {$sharedLibs}"),
             'LD_LIBRARY_PATH' => BUILD_LIB_PATH,
         ];
@@ -299,7 +347,31 @@ class PhpExtensionPackage extends Package
     #[Stage]
     public function phpizeForUnix(array $env, PhpExtensionPackage $package): void
     {
-        shell()->cd($package->getSourceDir())->setEnv($env)->exec(BUILD_BIN_PATH . '/phpize');
+        shell()->cd($package->getSourceRoot())->setEnv($env)->exec(BUILD_BIN_PATH . '/phpize');
+    }
+
+    /**
+     * A phpize Makefile defines neither RE2C nor RE2C_FLAGS, so an extension whose sources ship
+     * only the .re file falls back to `$(RE2C) $(RE2C_FLAGS) -o out.c in.re` with both empty and
+     * dies with "-o: command not found". Release tarballs ship the generated .c, but php-src git
+     * checkouts and tag archives (every pre-release) do not — that is how ext/pdo breaks. Reuse
+     * whatever the main php-src configure resolved, so -g/cgoto stays consistent with the SAPIs.
+     *
+     * @return list<string>
+     */
+    public function re2cMakeVars(): array
+    {
+        $vars = ['RE2C' => 're2c', 'RE2C_FLAGS' => '--no-generation-date -W'];
+        $makefile = SOURCE_PATH . '/php-src/Makefile';
+        if (is_file($makefile)) {
+            $content = (string) file_get_contents($makefile);
+            foreach (array_keys($vars) as $key) {
+                if (preg_match('/^' . $key . '\s*=\s*(.*)$/m', $content, $m) && trim($m[1]) !== '') {
+                    $vars[$key] = trim($m[1]);
+                }
+            }
+        }
+        return array_map(static fn (string $k, string $v): string => $k . '=' . escapeshellarg($v), array_keys($vars), $vars);
     }
 
     /**
@@ -309,8 +381,7 @@ class PhpExtensionPackage extends Package
     public function configureForUnix(array $env, PhpExtensionPackage $package): void
     {
         $phpvars = getenv('SPC_EXTRA_PHP_VARS') ?: '';
-        // CustomPhpConfigureArg keys are OS names ('Linux'/'Darwin'), not platform strings
-        shell()->cd($package->getSourceDir())
+        shell()->cd($package->getSourceRoot())
             ->setEnv($env)
             ->exec(
                 './configure ' . $this->getPhpConfigureArg(SystemTarget::getTargetOS(), true) .
@@ -325,53 +396,16 @@ class PhpExtensionPackage extends Package
     #[Stage]
     public function makeForUnix(array $env, PhpExtensionPackage $package, PackageBuilder $builder): void
     {
-        // phpize Makefile's _SHARED_LIBADD line misses our static archives — splice them in
-        $package->patchSharedLibAdd();
-        $extra_ldflags = (string) getenv('SPC_CMD_VAR_PHP_MAKE_EXTRA_LDFLAGS');
-        $makeArgs = $extra_ldflags !== '' ? 'EXTRA_LDFLAGS=' . escapeshellarg($extra_ldflags) : '';
-        shell()->cd($package->getSourceDir())
+        $makeArgs = implode(' ', $package->re2cMakeVars());
+        shell()->cd($package->getSourceRoot())
             ->setEnv($env)
             ->exec('make clean')
             ->exec("make -j{$builder->concurrency} {$makeArgs}")
-            ->exec("make install {$makeArgs}");
-
-        // install-modules deref'd libtool's `$ext.so → $ext-X.so` symlink into two regular files; restore the symlink.
-        if (preg_match('/-release\s+(\S+)/', $extra_ldflags, $m)) {
-            $name = $package->getExtensionName();
-            $unversioned = BUILD_MODULES_PATH . "/{$name}.so";
-            $versioned = BUILD_MODULES_PATH . "/{$name}-{$m[1]}.so";
-            if (file_exists($versioned) && file_exists($unversioned) && !is_link($unversioned)) {
-                unlink($unversioned);
-                symlink(basename($versioned), $unversioned);
-            }
-        }
-    }
-
-    public function patchSharedLibAdd(): void
-    {
-        $config = new SPCConfigUtil()->getExtensionConfig($this);
-        [$staticLibs, $sharedLibs] = $this->splitLibsIntoStaticAndShared($config['libs']);
-        $lstdcpp = str_contains($sharedLibs, '-l:libstdc++.a')
-            ? '-l:libstdc++.a'
-            : (str_contains($sharedLibs, '-lstdc++') ? '-lstdc++' : '');
-
-        $makefile = $this->getSourceDir() . '/Makefile';
-        if (!is_file($makefile)) {
-            return;
-        }
-        $content = (string) file_get_contents($makefile);
-        if (!preg_match('/^(.*_SHARED_LIBADD\s*=\s*)(.*)$/m', $content, $m)) {
-            return;
-        }
-        $prefix = $m[1];
-        $current = trim($m[2]);
-        $merged = clean_spaces("{$current} {$staticLibs} {$lstdcpp}");
-        $merged = deduplicate_flags($merged);
-        FileSystem::replaceFileRegex(
-            $makefile,
-            '/^(.*_SHARED_LIBADD\s*=.*)$/m',
-            $prefix . $merged
-        );
+            ->exec("make install {$makeArgs}")
+            // distclean after install: phpize build residues (.lo/.libs/config.status) would
+            // poison a later static in-tree build sharing this source dir (php-src's make
+            // clean uses find, which does not follow the ext symlink)
+            ->exec('make distclean');
     }
 
     /**

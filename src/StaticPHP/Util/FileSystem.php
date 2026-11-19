@@ -174,7 +174,7 @@ class FileSystem
     public static function convertWinPathToMinGW(string $path): string
     {
         if (preg_match('/^[A-Za-z]:/', $path)) {
-            $path = '/' . strtolower($path[0]) . '/' . str_replace('\\', '/', substr($path, 2));
+            $path = '/' . strtolower($path[0]) . '/' . str_replace('\\', '/', ltrim(substr($path, 2), '\/'));
         }
         return $path;
     }
@@ -296,6 +296,19 @@ class FileSystem
     {
         $dir = self::convertPath($dir);
         logger()->debug('Removing path recursively: "' . $dir . '"');
+
+        // A directory link (symlink or NTFS junction) must be removed as a link:
+        // recursing into it would delete the target's contents instead. Junctions
+        // are invisible to file_exists()/is_dir() when dangling, so check isLink()
+        // before bailing out on a "missing" path.
+        if (self::isLink($dir)) {
+            if (!self::removeLink($dir)) {
+                logger()->warning('Remove link failed: ' . $dir);
+                return false;
+            }
+            return true;
+        }
+
         if (!file_exists($dir)) {
             logger()->debug('Scan dir failed, no such file or directory.');
             return false;
@@ -311,6 +324,12 @@ class FileSystem
             logger()->warning('Scan dir failed, cannot scan directory: ' . $dir);
             return false;
         }
+
+        // Keep going when a single entry fails: aborting on the first error leaves
+        // an unpredictable part of the tree behind, which callers cannot detect
+        // reliably (e.g. stale PHP build objects leaking into the next version).
+        $success = true;
+
         // 遍历目录
         foreach ($scan_list as $v) {
             if ($callback) {
@@ -321,26 +340,35 @@ class FileSystem
                 continue;
             }
             $sub_file = self::convertPath($dir . '/' . $v);
-            if (is_link($sub_file) || is_file($sub_file)) {
-                if (!unlink($sub_file)) {
-                    $cmd = PHP_OS_FAMILY === 'Windows' ? 'del /f /q' : 'rm -f';
-                    f_exec("{$cmd} " . escapeshellarg($sub_file), $out, $ret);
-                    if ($ret !== 0) {
-                        logger()->warning('Remove file failed: ' . $sub_file);
-                        return false;
-                    }
+            if (self::isLink($sub_file)) {
+                if (!self::removeLink($sub_file)) {
+                    logger()->warning('Remove link failed: ' . $sub_file);
+                    $success = false;
+                }
+            } elseif (is_file($sub_file)) {
+                if (!self::removeFile($sub_file)) {
+                    $success = false;
                 }
             } elseif (is_dir($sub_file)) {
                 # 如果是 目录 且 递推 , 则递推添加下级文件
                 if (!self::removeDir($sub_file)) {
-                    return false;
+                    $success = false;
+                }
+            } elseif (file_exists($sub_file)) {
+                // Reparse point we cannot classify as file/directory (e.g. a
+                // junction on Windows): remove the link itself.
+                if (!self::removeLink($sub_file)) {
+                    logger()->warning('Remove path failed: ' . $sub_file);
+                    $success = false;
                 }
             }
         }
-        if (is_link($dir)) {
-            return @unlink($dir);
+        if (!@rmdir($dir)) {
+            $last_error = error_get_last();
+            logger()->warning("Remove directory failed: {$dir}: " . ($last_error['message'] ?? 'unknown error'));
+            $success = false;
         }
-        return @rmdir($dir);
+        return $success;
     }
 
     /**
@@ -411,7 +439,7 @@ class FileSystem
         $replacement = [
             '{build_root_path}' => BUILD_ROOT_PATH,
             '{pkg_root_path}' => PKG_ROOT_PATH,
-            '{php_sdk_path}' => getenv('PHP_SDK_PATH') ? getenv('PHP_SDK_PATH') : WORKING_DIR . '/php-sdk-binary-tools',
+            '{spc_msys2_path}' => getenv('SPC_MSYS2_PATH') ?: (PKG_ROOT_PATH . DIRECTORY_SEPARATOR . 'msys2-build-essentials' . DIRECTORY_SEPARATOR . 'msys64'),
             '{working_dir}' => WORKING_DIR,
             '{download_path}' => DOWNLOAD_PATH,
             '{source_path}' => SOURCE_PATH,
@@ -455,6 +483,136 @@ class FileSystem
         $string = self::convertPath($string);
         if (file_exists($string)) {
             unlink($string);
+        }
+    }
+
+    /**
+     * Whether the path is a link to another location. Besides symlinks this also
+     * detects NTFS directory junctions on Windows, which PHP's is_link() does not
+     * recognize (php-src only flags IO_REPARSE_TAG_SYMLINK as S_IFLNK in lstat).
+     *
+     * Do not rely on readlink() alone: php-src's Win32 implementation falls back to
+     * GetFinalPathNameByHandleW() for non-reparse paths, so readlink() returns the
+     * canonical path for every existing path and would make everything look like a
+     * link. A junction instead has a distinctive stat shape: it exists, but both
+     * is_dir() and is_file() report false.
+     *
+     * @param string $path Path to check
+     */
+    public static function isLink(string $path): bool
+    {
+        if (is_link($path)) {
+            return true;
+        }
+        if (PHP_OS_FAMILY !== 'Windows') {
+            return false;
+        }
+        $path = self::convertPath($path);
+        // Strip trailing separators (but keep drive/UNC roots) so that is_dir() does
+        // not follow the reparse point and report the target.
+        if (strlen($path) > 3) {
+            $path = rtrim($path, '/\\');
+        }
+        clearstatcache(true, $path);
+
+        // php-src keeps st_mode = 0 for reparse points it cannot classify
+        // (junctions: FILE_ATTRIBUTE_REPARSE_POINT without IO_REPARSE_TAG_SYMLINK),
+        // so lstat() reports neither file, directory nor link.
+        $stat = @lstat($path);
+        if ($stat !== false && ($stat['mode'] & 0170000) === 0) {
+            return true;
+        }
+
+        if (file_exists($path)) {
+            return !is_dir($path) && !is_file($path);
+        }
+        // Dangling junction/symlink: the path does not exist, but the link still does.
+        return @readlink($path) !== false;
+    }
+
+    /**
+     * Remove a link itself without touching its target. On Windows, directory
+     * links (symlinks and junctions) must be removed with rmdir(), whose
+     * underlying RemoveDirectory deletes the link rather than its contents.
+     *
+     * @param string $path Link path to remove
+     */
+    public static function removeLink(string $path): bool
+    {
+        if (PHP_OS_FAMILY === 'Windows') {
+            // Directory links are removed with rmdir(); file symlinks with unlink().
+            // Order matters: junctions are not reported as directories by is_dir().
+            if (@rmdir($path)) {
+                return true;
+            }
+            return @unlink($path);
+        }
+        return @unlink($path);
+    }
+
+    /**
+     * Link a directory to another location. On Windows an NTFS junction is
+     * created via mklink /J: unlike symlinks, junctions need no elevated
+     * privileges or developer mode, and they are transparent to all Win32
+     * tooling (configure.js, nmake, buildconf).
+     *
+     * @param  string $target Existing directory the link points to
+     * @param  string $link   Link path to create
+     * @return bool   Whether the link was created
+     */
+    public static function linkDir(string $target, string $link): bool
+    {
+        $target_path = self::convertPath($target);
+        $link_path = self::convertPath($link);
+        if (PHP_OS_FAMILY !== 'Windows') {
+            return symlink($target_path, $link_path);
+        }
+        [$code] = cmd(false)->execWithResult('mklink /J "' . $link_path . '" "' . $target_path . '"', false);
+        // Junctions are invisible to is_dir() on Windows, so verify with isLink().
+        return $code === 0 && self::isLink($link_path);
+    }
+
+    /**
+     * Replace every symlink under a directory with a regular copy of its target,
+     * dropping links whose target does not exist. Used on Windows after archive
+     * extraction: tools like xcopy fail on (dangling) symlinks, e.g. the
+     * LICENSE-zstd link shipped in the php-ext-zstd tarball.
+     *
+     * @param string $dir Directory to sanitize
+     */
+    public static function sanitizeSymlinks(string $dir): void
+    {
+        $dir = self::convertPath($dir);
+        if (!is_dir($dir)) {
+            return;
+        }
+        $items = scandir($dir);
+        if ($items === false) {
+            return;
+        }
+        foreach ($items as $item) {
+            if ($item === '.' || $item === '..') {
+                continue;
+            }
+            $path = $dir . DIRECTORY_SEPARATOR . $item;
+            if (is_link($path)) {
+                $target = realpath($path);
+                unlink($path);
+                if ($target === false) {
+                    logger()->debug("Removed dangling symlink: {$path}");
+                    continue;
+                }
+                if (is_dir($target)) {
+                    self::copyDir($target, $path);
+                    self::sanitizeSymlinks($path);
+                } else {
+                    copy($target, $path);
+                }
+                continue;
+            }
+            if (is_dir($path)) {
+                self::sanitizeSymlinks($path);
+            }
         }
     }
 
@@ -533,6 +691,34 @@ class FileSystem
                 throw new FileSystemException("Failed to remove source file: {$source}");
             }
         }
+    }
+
+    /**
+     * Remove a single file, handling read-only files and shell fallbacks.
+     *
+     * @param string $file File path to remove
+     */
+    private static function removeFile(string $file): bool
+    {
+        if (@unlink($file)) {
+            return true;
+        }
+        $last_error = error_get_last();
+        logger()->debug("unlink failed for '{$file}': " . ($last_error['message'] ?? 'unknown error') . ', attempting chmod + unlink');
+
+        // Go module cache files are often read-only; make writable and retry
+        if (@chmod($file, 0666) && @unlink($file)) {
+            return true;
+        }
+
+        // Shell fallback: del /f /q forces deletion of read-only files on Windows
+        $cmd = PHP_OS_FAMILY === 'Windows' ? 'del /f /q' : 'rm -f';
+        f_exec("{$cmd} " . escapeshellarg($file), $out, $ret);
+        if ($ret !== 0) {
+            logger()->warning('Remove file failed: ' . $file);
+            return false;
+        }
+        return true;
     }
 
     private static function replaceFile(string $filename, int $replace_type = REPLACE_FILE_STR, mixed $callback_or_search = null, mixed $to_replace = null): false|int

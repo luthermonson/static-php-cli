@@ -4,147 +4,84 @@ declare(strict_types=1);
 
 namespace Package\Artifact;
 
+use StaticPHP\Artifact\Artifact;
 use StaticPHP\Artifact\ArtifactDownloader;
 use StaticPHP\Artifact\Downloader\DownloadResult;
 use StaticPHP\Artifact\Downloader\Type\CheckUpdateResult;
 use StaticPHP\Artifact\Downloader\Type\GitHubTokenSetupTrait;
-use StaticPHP\Attribute\Artifact\AfterBinaryExtract;
 use StaticPHP\Attribute\Artifact\CustomBinary;
-use StaticPHP\Attribute\Artifact\CustomBinaryCheckUpdate;
-use StaticPHP\DI\ApplicationContext;
-use StaticPHP\Exception\BuildFailureException;
+use StaticPHP\Attribute\Artifact\CustomSource;
+use StaticPHP\Attribute\Artifact\CustomSourceCheckUpdate;
 use StaticPHP\Exception\DownloaderException;
-use StaticPHP\Package\PackageBuilder;
+use StaticPHP\Runtime\SystemTarget;
+use StaticPHP\Toolchain\ToolchainManager;
 
 class llvm_tools
 {
     use GitHubTokenSetupTrait;
 
-    public const array TOOLS = ['llvm-objcopy', 'llvm-strip', 'llvm-profdata'];
+    #[CustomSource('llvm-tools')]
+    public function downSource(ArtifactDownloader $downloader): DownloadResult
+    {
+        $version = $this->clangVersion();
+        $filename = "llvm-project-{$version}.src.tar.xz";
+        $url = "https://github.com/llvm/llvm-project/releases/download/llvmorg-{$version}/{$filename}";
+        default_shell()->executeCurlDownload(
+            $url,
+            DOWNLOAD_PATH . DIRECTORY_SEPARATOR . $filename,
+            headers: $this->getGitHubTokenHeaders(),
+            retries: $downloader->getRetry(),
+        );
+        return DownloadResult::archive($filename, ['url' => $url], version: $version);
+    }
 
     #[CustomBinary('llvm-tools', [
         'linux-x86_64',
         'linux-aarch64',
-        'macos-x86_64',
-        'macos-aarch64',
     ])]
-    public function downBinary(ArtifactDownloader $downloader): DownloadResult
+    public function downBinary(ArtifactDownloader $downloader, Artifact $artifact): DownloadResult
     {
-        $llvmVersion = $this->detectLlvmVersion()
-            ?? throw new DownloaderException('Could not detect a clang version on host; install zig or clang first');
-        $tarball = "llvm-project-{$llvmVersion}.src.tar.xz";
-        $url = "https://github.com/llvm/llvm-project/releases/download/llvmorg-{$llvmVersion}/{$tarball}";
-        $tarballPath = DOWNLOAD_PATH . '/' . $tarball;
-        default_shell()->executeCurlDownload($url, $tarballPath, headers: $this->getGitHubTokenHeaders(), retries: $downloader->getRetry());
-        return DownloadResult::archive($tarball, ['url' => $url, 'version' => $llvmVersion], extract: '{source_path}/llvm-tools', verified: false, version: $llvmVersion);
+        // The tools run on the build host, so the host architecture selects the archive, not
+        // SPC_TARGET; they are static musl executables and run on any Linux distribution.
+        $clang = $this->clangVersion();
+        // Pre-built archives: llvm-tools-{host-arch}-linux-musl-{clang-version}.txz plus a .sha256 sidecar.
+        $filename = 'llvm-tools-' . GNU_ARCH . "-linux-musl-{$clang}.txz";
+        $base_url = $artifact->getBinaryDownloadConfig()['base-url'] ?? null;
+        if (!is_string($base_url) || $base_url === '') {
+            throw new DownloaderException('llvm-tools: binary config for ' . SystemTarget::getCurrentPlatformString() . ' does not define a base-url');
+        }
+        $url = $base_url . $filename;
+        $path = DOWNLOAD_PATH . DIRECTORY_SEPARATOR . $filename;
+        default_shell()->executeCurlDownload($url, $path, retries: $downloader->getRetry());
+
+        // Published next to the archive by the llvm-tools workflow of static-php/hosted.
+        $checksum = default_shell()->executeCurl("{$url}.sha256", retries: $downloader->getRetry());
+        $expected = is_string($checksum) ? strtolower((string) strtok(trim($checksum), " \t")) : '';
+        if (preg_match('/^[0-9a-f]{64}$/', $expected) !== 1) {
+            throw new DownloaderException("Cannot fetch the checksum of {$filename} from {$url}.sha256");
+        }
+        if (($actual = hash_file('sha256', $path)) !== $expected) {
+            unlink($path);
+            throw new DownloaderException("Hash mismatch for downloaded {$filename}. Expected {$expected}, got {$actual}");
+        }
+        return DownloadResult::archive($filename, ['url' => $url], extract: '{pkg_root_path}/llvm-tools', verified: true, version: $clang);
     }
 
-    #[CustomBinaryCheckUpdate('llvm-tools', [
-        'linux-x86_64',
-        'linux-aarch64',
-        'macos-x86_64',
-        'macos-aarch64',
-    ])]
-    public function checkUpdateBinary(?string $old_version, ArtifactDownloader $downloader): CheckUpdateResult
+    #[CustomSourceCheckUpdate('llvm-tools')]
+    public function checkUpdateSource(?string $old_version): CheckUpdateResult
     {
-        $llvmVersion = $this->detectLlvmVersion()
-            ?? throw new DownloaderException('Could not detect a clang version on host; install zig or clang first');
-        return new CheckUpdateResult(
-            old: $old_version,
-            new: $llvmVersion,
-            needUpdate: $old_version === null || $llvmVersion !== $old_version,
-        );
+        $version = $this->clangVersion();
+        return new CheckUpdateResult(old: $old_version, new: $version, needUpdate: $old_version !== $version);
     }
 
-    #[AfterBinaryExtract('llvm-tools', [
-        'linux-x86_64',
-        'linux-aarch64',
-        'macos-x86_64',
-        'macos-aarch64',
-    ])]
-    public function postExtract(string $target_path): void
+    /**
+     * The clang version of the active toolchain, used as the key for the LLVM assets these
+     * artifacts download. Resolved through the toolchain so an artifact no longer has to know
+     * anything about the zig package.
+     */
+    private function clangVersion(): string
     {
-        $this->buildForHost($target_path);
-    }
-
-    public function buildForHost(?string $sourceRoot = null): void
-    {
-        $sourceRoot ??= SOURCE_PATH . '/llvm-tools';
-        $binDir = PKG_ROOT_PATH . '/llvm-tools/bin';
-        if ($this->allBuilt($binDir)) {
-            return;
-        }
-        $llvmDir = "{$sourceRoot}/llvm";
-        if (!is_dir($llvmDir)) {
-            throw new BuildFailureException("llvm-tools: missing source at {$llvmDir} (extraction layout changed?)");
-        }
-        $buildDir = "{$sourceRoot}/build";
-        $installDir = PKG_ROOT_PATH . '/llvm-tools';
-        f_mkdir($buildDir, recursive: true);
-        f_mkdir($binDir, recursive: true);
-
-        $cmakeArgs = implode(' ', array_map('escapeshellarg', [
-            '-S', $llvmDir,
-            '-B', $buildDir,
-            '-DCMAKE_BUILD_TYPE=Release',
-            '-DLLVM_ENABLE_PROJECTS=',
-            '-DLLVM_TARGETS_TO_BUILD=',
-            '-DLLVM_INCLUDE_BENCHMARKS=OFF',
-            '-DLLVM_INCLUDE_TESTS=OFF',
-            '-DLLVM_INCLUDE_EXAMPLES=OFF',
-            '-DLLVM_INCLUDE_DOCS=OFF',
-            '-DLLVM_ENABLE_ZLIB=OFF',
-            '-DLLVM_ENABLE_ZSTD=OFF',
-            '-DLLVM_ENABLE_LIBXML2=OFF',
-            '-DLLVM_ENABLE_TERMINFO=OFF',
-            '-DLLVM_ENABLE_LIBEDIT=OFF',
-            '-DLLVM_ENABLE_LIBPFM=OFF',
-            '-DLLVM_BUILD_LLVM_DYLIB=OFF',
-            '-DLLVM_LINK_LLVM_DYLIB=OFF',
-            '-DBUILD_SHARED_LIBS=OFF',
-            '-DCMAKE_C_COMPILER=' . PKG_ROOT_PATH . '/zig/zig-cc',
-            '-DCMAKE_CXX_COMPILER=' . PKG_ROOT_PATH . '/zig/zig-c++',
-            '-DCMAKE_INSTALL_PREFIX=' . $installDir,
-        ]));
-        $jobs = ApplicationContext::get(PackageBuilder::class)->concurrency;
-        $targetArgs = implode(' ', array_map(fn ($t) => '--target ' . escapeshellarg($t), self::TOOLS));
-
-        shell()
-            ->setEnv(['SPC_TARGET' => GNU_ARCH . '-linux-musl'])
-            ->exec('cmake ' . $cmakeArgs)
-            ->exec('cmake --build ' . escapeshellarg($buildDir) . ' ' . $targetArgs . " -j {$jobs}");
-
-        foreach (self::TOOLS as $t) {
-            $built = "{$buildDir}/bin/{$t}";
-            if (!is_file($built)) {
-                throw new BuildFailureException("llvm-tools: missing build output {$built}");
-            }
-            copy($built, "{$binDir}/{$t}");
-            chmod("{$binDir}/{$t}", 0755);
-        }
-    }
-
-    public function allBuilt(string $binDir): bool
-    {
-        foreach (self::TOOLS as $t) {
-            $p = "{$binDir}/{$t}";
-            if (!is_file($p) || !is_executable($p)) {
-                return false;
-            }
-        }
-        return true;
-    }
-
-    private function detectLlvmVersion(): ?string
-    {
-        $zig = PKG_ROOT_PATH . '/zig/zig';
-        if (!is_file($zig)) {
-            return null;
-        }
-        [$rc, $out] = shell()->execWithResult(escapeshellarg($zig) . ' cc --version', false);
-        if ($rc !== 0) {
-            return null;
-        }
-        return preg_match('/clang version (\d+\.\d+\.\d+)/', implode("\n", $out), $m) ? $m[1] : null;
+        return ToolchainManager::getToolchain()?->getCompilerVersion()
+            ?? throw new DownloaderException('Cannot determine the clang version of the active toolchain; install the zig toolchain first (`bin/spc doctor`)');
     }
 }

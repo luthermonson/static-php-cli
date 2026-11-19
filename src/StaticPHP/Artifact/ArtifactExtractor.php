@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace StaticPHP\Artifact;
 
 use StaticPHP\DI\ApplicationContext;
+use StaticPHP\Exception\ExecutionException;
 use StaticPHP\Exception\FileSystemException;
 use StaticPHP\Exception\SPCInternalException;
 use StaticPHP\Exception\WrongUsageException;
@@ -136,7 +137,6 @@ class ArtifactExtractor
             throw new WrongUsageException("Artifact source [{$name}] not downloaded, please download it first!");
         }
 
-        // Local (--custom-local): source lives in place at $cache_info['dirname'].
         if (($cache_info['cache_type'] ?? null) === 'local') {
             $artifact->emitAfterSourceExtract($artifact->getSourceDir());
             return SPC_STATUS_ALREADY_EXTRACTED;
@@ -164,6 +164,9 @@ class ArtifactExtractor
         $extract_config = $artifact->getDownloadConfig('source')['extract'] ?? null;
         if (is_array($extract_config)) {
             $this->doSelectiveExtract($name, $cache_info, $extract_config);
+            if (PHP_OS_FAMILY === 'Windows') {
+                FileSystem::sanitizeSymlinks($target_path);
+            }
             $artifact->emitAfterSourceExtract($target_path);
             logger()->debug("Emitted after-source-extract hooks for [{$name}]");
             return SPC_STATUS_EXTRACTED;
@@ -177,18 +180,23 @@ class ArtifactExtractor
             return SPC_STATUS_ALREADY_EXTRACTED;
         }
 
-        // Remove old directory if hash mismatch.
-        // Guard: a symlink at $target_path (left over from older local-source handling) must be
-        // unlinked directly — never recurse into the link target, that would wipe the user's tree.
-        if (is_link($target_path)) {
-            @unlink($target_path);
+        // Remove old directory if hash mismatch
+        if (FileSystem::isLink($target_path)) {
+            logger()->debug("Source [{$name}] is linked to a local directory, relinking...");
+            $this->assertSourceDirClean($name, $target_path, FileSystem::removeLink($target_path));
         } elseif (is_dir($target_path)) {
             logger()->notice("Source [{$name}] hash mismatch, re-extracting...");
-            FileSystem::removeDir($target_path);
+            $this->assertSourceDirClean($name, $target_path, FileSystem::removeDir($target_path));
         }
 
         logger()->info("Extracting source [{$name}] to {$target_path}...");
         $this->doStandardExtract($name, $cache_info, $target_path);
+
+        if (PHP_OS_FAMILY === 'Windows') {
+            // symlinks in archives (e.g. LICENSE-zstd in php-ext-zstd) break
+            // tooling like xcopy, materialize them as regular files
+            FileSystem::sanitizeSymlinks($target_path);
+        }
 
         // Emit after hooks
         $artifact->emitAfterSourceExtract($target_path);
@@ -238,6 +246,27 @@ class ArtifactExtractor
         $mode = $extract_config['mode'];
 
         if ($mode === 'selective') {
+            // Check if all destination files already exist before extracting
+            $all_files_exist = true;
+            foreach ($extract_config['files'] as $src_pattern => $dst_path) {
+                $resolved = $this->replacePathVariables($dst_path);
+                // For glob patterns, check if at least the parent directory exists
+                if (str_contains($src_pattern, '*')) {
+                    $parent = dirname($resolved);
+                    if (!is_dir($parent)) {
+                        $all_files_exist = false;
+                        break;
+                    }
+                } elseif (!file_exists($resolved) && !is_dir($resolved)) {
+                    $all_files_exist = false;
+                    break;
+                }
+            }
+            if ($all_files_exist) {
+                logger()->debug("Binary [{$name}] already extracted (selective), skip.");
+                return SPC_STATUS_ALREADY_EXTRACTED;
+            }
+
             $this->doSelectiveExtract($name, $cache_info, $extract_config['files']);
             $artifact->emitAfterBinaryExtract($target_path, $platform);
             logger()->debug("Emitted after-binary-extract hooks for [{$name}]");
@@ -261,8 +290,14 @@ class ArtifactExtractor
         logger()->debug("Emitted after-binary-extract hooks for [{$name}]");
 
         /* @phpstan-ignore-next-line */
-        if ($hash !== null && $cache_info['cache_type'] !== 'file') {
-            FileSystem::writeFile("{$target_path}/.spc-hash", $hash);
+        if ($hash !== null) {
+            // Directory targets: store hash inside the directory
+            if (is_dir($target_path)) {
+                FileSystem::writeFile("{$target_path}/.spc-hash", $hash);
+            } elseif (is_file($target_path)) {
+                // File targets: store hash as a sidecar file (e.g., meson .whl)
+                FileSystem::writeFile("{$target_path}.spc-hash", $hash);
+            }
         }
         return SPC_STATUS_EXTRACTED;
     }
@@ -341,10 +376,47 @@ class ArtifactExtractor
     }
 
     /**
+     * Fail loudly when the stale source tree could not be removed before extraction.
+     *
+     * Extracting over a partially removed tree silently mixes the old version's sources and
+     * build artifacts with the new one (e.g. object files built against a previous PHP
+     * version's headers being linked into the new build).
+     *
+     * @throws ExecutionException When the old directory is still there
+     */
+    protected function assertSourceDirClean(string $name, string $target_path, bool $removed): void
+    {
+        if ($removed && !file_exists($target_path) && !FileSystem::isLink($target_path)) {
+            return;
+        }
+        $hint = PHP_OS_FAMILY === 'Windows' ? ' (Windows: rmdir /s /q "' . FileSystem::convertPath($target_path) . '")' : '';
+        throw new ExecutionException(
+            "Failed to remove stale source directory for artifact [{$name}]: {$target_path}\n" .
+            'Refusing to extract on top of it, because old build artifacts would leak into the new source tree.' . "\n" .
+            'Remove it manually and retry.' . $hint,
+        );
+    }
+
+    /**
      * Check if artifact is already extracted with correct hash.
+     *
+     * Handles both directory targets (hash stored in $path/.spc-hash) and
+     * file targets (hash stored in $path.spc-hash sidecar).
      */
     protected function isAlreadyExtracted(string $path, ?string $expected_hash): bool
     {
+        // File targets: check sidecar hash file (e.g., meson .whl)
+        if (is_file($path)) {
+            if ($expected_hash === null) {
+                return false;
+            }
+            $hash_file = "{$path}.spc-hash";
+            if (!file_exists($hash_file)) {
+                return false;
+            }
+            return FileSystem::readFile($hash_file) === $expected_hash;
+        }
+
         if (!is_dir($path)) {
             return false;
         }
@@ -474,7 +546,7 @@ class ArtifactExtractor
      *
      * Supports: tar, tar.gz, tgz, tar.bz2, tar.xz, txz, zip, exe
      *
-     * @param bool $merge when true, merge zip contents into existing target dir instead of wiping it
+     * @param bool $merge when true, merge contents into existing target dir instead of wiping it
      */
     protected function extractArchive(string $filename, string $target, bool $merge = false): void
     {
@@ -483,10 +555,17 @@ class ArtifactExtractor
 
         $extname = FileSystem::extname($filename);
 
-        if ($extname !== 'exe' && !is_dir($target)) {
-            FileSystem::createDir($target);
+        if ($extname !== 'exe') {
+            // tar extraction merges into whatever is already there, so a re-extract would
+            // leave files from the previous version behind
+            if (!$merge && is_dir($target)) {
+                FileSystem::removeDir($target);
+            }
             if (!is_dir($target)) {
-                throw new FileSystemException("Failed to create target directory: {$target}");
+                FileSystem::createDir($target);
+                if (!is_dir($target)) {
+                    throw new FileSystemException("Failed to create target directory: {$target}");
+                }
             }
         }
         match (SystemTarget::getTargetOS()) {
@@ -624,7 +703,7 @@ class ArtifactExtractor
             '{source_path}' => SOURCE_PATH,
             '{download_path}' => DOWNLOAD_PATH,
             '{working_dir}' => WORKING_DIR,
-            '{php_sdk_path}' => getenv('PHP_SDK_PATH') ?: '',
+            '{spc_msys2_path}' => getenv('SPC_MSYS2_PATH') ?: '',
         ];
         return str_replace(array_keys($replacement), array_values($replacement), $path);
     }

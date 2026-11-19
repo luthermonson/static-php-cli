@@ -131,7 +131,6 @@ jobs:
     if: needs.check-gate.outputs.enabled == 'true'
     runs-on: ubuntu-latest
     permissions:
-      pull-requests: write
       contents: read
     outputs:
       need_test:             ${{ steps.bot.outputs.need_test }}
@@ -168,23 +167,17 @@ jobs:
           echo "php_versions=$(echo "$BOT_JSON" | jq -c '.php_versions')"                 >> "$GITHUB_OUTPUT"
           echo "tier2=$(echo "$BOT_JSON" | jq -r '.tier2')"                               >> "$GITHUB_OUTPUT"
 
-          COMMENT_BODY=$(echo "$BOT_JSON" | jq -r '.comment_body')
-          MARKER="<!-- spc-test-bot -->"
+          # Save JSON for the comment-posting workflow
+          jq -n --argjson bot "$BOT_JSON" \
+            --arg pr '${{ github.event.pull_request.number }}' \
+            '$bot + {pr_number: $pr}' > bot-output.json
 
-          # Find existing bot comment id
-          EXISTING_ID=$(gh api \
-            repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments \
-            --jq "[.[] | select(.body | startswith(\"$MARKER\")) | .id] | first // empty")
-
-          if [ -n "$EXISTING_ID" ]; then
-            gh api --method PATCH \
-              repos/${{ github.repository }}/issues/comments/"$EXISTING_ID" \
-              -f body="$COMMENT_BODY"
-          else
-            gh pr comment ${{ github.event.pull_request.number }} \
-              --repo ${{ github.repository }} \
-              --body "$COMMENT_BODY"
-          fi
+      - name: Upload bot output
+        uses: actions/upload-artifact@v4
+        with:
+          name: bot-output
+          path: bot-output.json
+          retention-days: 1
 
   gen-matrix:
     name: "Generate test matrix"
@@ -234,7 +227,7 @@ jobs:
           echo "matrix=$(echo "$FINAL" | jq -c '{"combo": .}')" >> "$GITHUB_OUTPUT"
 
   ext-test:
-    name: "Ext test: ${{ matrix.combo.extension }} (PHP ${{ matrix.combo.php-version }} · ${{ matrix.combo.os }}-${{ matrix.combo.arch }})"
+    name: "Ext test: ${{ matrix.combo.extension }} [${{ matrix.combo.sapi }}] (PHP ${{ matrix.combo.php-version }} - ${{ matrix.combo.os }}-${{ matrix.combo.arch }})"
     needs: gen-matrix
     runs-on: ${{ matrix.combo.runner }}
     timeout-minutes: 120
@@ -257,13 +250,21 @@ jobs:
       - name: Install dependencies
         run: composer install -q --no-ansi --no-interaction --no-scripts --no-progress --prefer-dist --no-dev
 
+      # Keep doctor in its own step: on Windows the default pwsh shell does not stop
+      # a `run: |` block when a native command exits non-zero, so a failed doctor
+      # (e.g. an auto-fix download error) used to be swallowed and the build kept
+      # running until it failed on a confusing environment check.
+      - name: Doctor
+        env:
+          SPC_USE_SUDO: "yes"
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: ./bin/spc doctor --auto-fix
+
       - name: Build
         env:
           SPC_USE_SUDO: "yes"
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          ./bin/spc doctor --auto-fix
-          ${{ matrix.combo.build-args }} --dl-with-php=${{ matrix.combo.php-version }}
+        run: ${{ matrix.combo.build-args }} --dl-with-php=${{ matrix.combo.php-version }}
 
 #      - name: Setup upterm session
 #        if: ${{ failure() }}
@@ -273,5 +274,5 @@ jobs:
         if: always() && hashFiles('log/**') != ''
         uses: actions/upload-artifact@v4
         with:
-          name: logs-${{ matrix.combo.os }}-${{ matrix.combo.arch }}-${{ matrix.combo.extension }}-php${{ matrix.combo.php-version }}
+          name: logs-${{ matrix.combo.os }}-${{ matrix.combo.arch }}-${{ matrix.combo.sapi }}-${{ matrix.combo.extension }}-php${{ matrix.combo.php-version }}
           path: log

@@ -18,6 +18,7 @@ Pick the installation method that fits your use case:
 | Method | Best for |
 |---|---|
 | Pre-built binary | Most users — download and run, no dependencies |
+| PHAR | Users who already have PHP >= 8.4 installed and prefer a single `.phar` file |
 | From source | Contributors, or anyone who needs to modify core build logic |
 | Vendor mode | Integrating StaticPHP into an existing PHP project |
 
@@ -40,8 +41,8 @@ curl -#fSL https://dl.static-php.dev/v3/spc-bin/nightly/spc-macos-x86_64 -o spc
 ```shell [macOS arm64]
 curl -#fSL https://dl.static-php.dev/v3/spc-bin/nightly/spc-macos-aarch64 -o spc
 ```
-```powershell [Windows x86_64]
-curl.exe -#fSL https://dl.static-php.dev/v3/spc-bin/nightly/spc-windows-x86_64.exe -o spc.exe
+```powershell [Windows x64]
+curl.exe -#fSL https://dl.static-php.dev/v3/spc-bin/nightly/spc-windows-x64.exe -o spc.exe
 ```
 :::
 
@@ -50,6 +51,19 @@ On Linux and macOS, mark the binary as executable before running it:
 ```bash
 chmod +x spc && ./spc --version
 ```
+
+## PHAR
+
+If you already have PHP >= 8.4 installed, you can use the `spc.phar` archive published alongside each release. It requires the `mbstring,posix,pcntl,iconv,phar,zlib` extensions.
+
+```bash
+curl -#fSL https://dl.static-php.dev/v3/spc-bin/nightly/spc.phar -o spc.phar
+chmod +x spc.phar && ./spc.phar --version
+# or run it through PHP explicitly
+php spc.phar --version
+```
+
+`spc.phar` is also attached to every [GitHub Release](https://github.com/crazywhalecc/static-php-cli/releases).
 
 ## From source
 

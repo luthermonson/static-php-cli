@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace StaticPHP\Runtime\Shell;
 
+use StaticPHP\Exception\ExecutionException;
 use StaticPHP\Exception\InterruptException;
 use StaticPHP\Exception\SPCInternalException;
 use StaticPHP\Runtime\SystemTarget;
@@ -39,9 +40,9 @@ class DefaultShell extends Shell
             default => "-X {$method}",
         };
         $header_arg = implode(' ', array_map(fn ($v) => '"-H' . $v . '"', $headers));
-        $retry_arg = $retries > 0 ? "--retry {$retries}" : '';
+        $retry_arg = self::curlRetryArgs($retries);
         $compressed_arg = $compressed ? '--compressed' : '';
-        $cmd = SPC_CURL_EXEC . " -sfSL --max-time 3600 {$retry_arg} {$compressed_arg} {$method_arg} {$header_arg} {$url_arg}";
+        $cmd = SPC_CURL_EXEC . " -sfSL --connect-timeout 15 --speed-limit 1 --speed-time 30 --max-time 3600 {$retry_arg} {$compressed_arg} {$method_arg} {$header_arg} {$url_arg}";
 
         $this->logCommandInfo($cmd);
         logger()->debug("[CURL EXECUTE] {$cmd}");
@@ -73,9 +74,9 @@ class DefaultShell extends Shell
         $path_arg = escapeshellarg($path);
 
         $header_arg = implode(' ', array_map(fn ($v) => '"-H' . $v . '"', $headers));
-        $retry_arg = $retries > 0 ? "--retry {$retries}" : '';
+        $retry_arg = self::curlRetryArgs($retries);
         $check = $this->console_putput ? '#' : 's';
-        $cmd = clean_spaces(SPC_CURL_EXEC . " -{$check}fSL --max-time 3600 {$retry_arg} {$header_arg} -o {$path_arg} {$url_arg}");
+        $cmd = clean_spaces(SPC_CURL_EXEC . " -{$check}fSL --connect-timeout 15 --speed-limit 1 --speed-time 30 --max-time 3600 {$retry_arg} {$header_arg} -o {$path_arg} {$url_arg}");
         $this->logCommandInfo($cmd);
         logger()->debug('[CURL DOWNLOAD] ' . $cmd);
         $this->passthru($cmd, $this->console_putput, capture_output: false, throw_on_error: true);
@@ -148,13 +149,30 @@ class DefaultShell extends Shell
         };
 
         $mute = $this->console_putput ? '' : ' 2>/dev/null';
-        $tar = SystemTarget::isUnix() ? 'tar' : '"C:\Windows\system32\tar.exe"';
+        $tar = $this->tarExecutable();
         $cmd = "{$tar} {$compression_flag}xf {$archive_arg} --strip-components {$strip} -C {$target_arg}{$mute}";
 
         $this->logCommandInfo($cmd);
         logger()->debug("[TAR EXTRACT] {$cmd}");
-        $this->passthru($cmd, $this->console_putput);
+        $this->passthruTolerateSymlinks($cmd);
         return true;
+    }
+
+    /**
+     * Execute a tar command to archive the contents of a directory.
+     *
+     * @param string $source_dir   Directory whose contents are archived
+     * @param string $archive_path Path to the tar file to create
+     */
+    public function executeTarCreate(string $source_dir, string $archive_path): void
+    {
+        $archive_arg = escapeshellarg(FileSystem::convertPath($archive_path));
+        $source_arg = escapeshellarg(FileSystem::convertPath($source_dir));
+        $cmd = "{$this->tarExecutable()} -cf {$archive_arg} -C {$source_arg} .";
+
+        $this->logCommandInfo($cmd);
+        logger()->debug("[TAR CREATE] {$cmd}");
+        $this->passthru($cmd, $this->console_putput);
     }
 
     /**
@@ -184,12 +202,14 @@ class DefaultShell extends Shell
      */
     public function execute7zExtract(string $archive_path, string $target_path): bool
     {
-        $sdk_path = getenv('PHP_SDK_PATH');
-        if ($sdk_path === false) {
-            throw new SPCInternalException('PHP_SDK_PATH environment variable is not set');
+        // 7za.exe is installed by the 7za-win target package into PKG_ROOT_PATH\bin,
+        // which is added to PATH by MSVCToolchain::initEnv().
+        $_7z_path = FileSystem::convertPath(PKG_ROOT_PATH . '\bin\7za.exe');
+        if (!file_exists($_7z_path)) {
+            throw new SPCInternalException('7za.exe not found. Please install the 7za-win target package.');
         }
 
-        $_7z = escapeshellarg(FileSystem::convertPath($sdk_path . '/bin/7za.exe'));
+        $_7z = escapeshellarg(FileSystem::convertPath($_7z_path));
         $archive_arg = escapeshellarg(FileSystem::convertPath($archive_path));
         $target_arg = escapeshellarg(FileSystem::convertPath($target_path));
 
@@ -198,10 +218,11 @@ class DefaultShell extends Shell
         $run = function ($cmd) {
             $this->logCommandInfo($cmd);
             logger()->debug("[7Z EXTRACT] {$cmd}");
-            $this->passthru($cmd, $this->console_putput);
+            $this->passthruTolerateSymlinks($cmd);
         };
 
         $extname = FileSystem::extname($archive_path);
+        $tar = $this->tarExecutable();
 
         match ($extname) {
             'tar' => $this->executeTarExtract($archive_path, $target_path, 'none'),
@@ -213,46 +234,90 @@ class DefaultShell extends Shell
     }
 
     /**
-     * Extract a compressed tar archive using only 7za, with strip-components
-     * handled in PHP.
+     * Build the cURL retry arguments shared by the request and download helpers.
      *
-     * Windows tar.exe cannot create symlinks without Developer Mode or admin
-     * privileges. 7za silently skips symlinks, avoiding that failure.
+     * `--retry` covers transient failures (HTTP 408/429/500/502/503/504 and timeouts) and
+     * removes the partial output file before retrying; `--retry-connrefused` also retries
+     * when a mirror refuses the connection for a moment. Both are supported by the cURL
+     * versions shipped on the supported platforms (7.52+).
      */
-    private function extract7zWithStripComponents(string $archive_path, string $target_path, string $_7z, int $strip = 1): void
+    private static function curlRetryArgs(int $retries): string
     {
-        $temp_dir = sys_get_temp_dir() . DIRECTORY_SEPARATOR . 'spc_' . bin2hex(random_bytes(8));
-        FileSystem::createDir($temp_dir);
-        $archive_arg = escapeshellarg(FileSystem::convertPath($archive_path));
-        $temp_arg = escapeshellarg($temp_dir);
+        if ($retries <= 0) {
+            return '';
+        }
+        return "--retry {$retries} --retry-delay 2 --retry-connrefused";
+    }
 
-        $cmd = "{$_7z} x {$archive_arg} -o{$temp_arg} -y";
-        $this->logCommandInfo($cmd);
-        logger()->debug("[7Z EXTRACT] {$cmd}");
-        $this->passthru($cmd, $this->console_putput);
-
-        $inner_tar = glob($temp_dir . DIRECTORY_SEPARATOR . '*.tar');
-        if ($inner_tar !== []) {
-            $tar_arg = escapeshellarg($inner_tar[0]);
-            $cmd = "{$_7z} x {$tar_arg} -o{$temp_arg} -y";
-            logger()->debug("[7Z EXTRACT TAR] {$cmd}");
+    /**
+     * Run an extraction command, tolerating symbolic links that the host cannot create.
+     *
+     * Windows tar.exe (bsdtar) cannot create the symbolic links some archives ship (e.g. zstd's
+     * tests/cli-tests/bin/unzstd -> zstd), failing each with "Can't create '...': Invalid argument"
+     * and exiting non-zero. Those entries are never needed to build, so on Windows we swallow a
+     * failure whose only errors are such symlink creations and continue. Any other failure still throws.
+     */
+    private function passthruTolerateSymlinks(string $cmd): void
+    {
+        // Symlink creation only fails on a Windows host; elsewhere extraction handles symlinks fine.
+        if (PHP_OS_FAMILY !== 'Windows') {
             $this->passthru($cmd, $this->console_putput);
-            @unlink($inner_tar[0]);
+            return;
         }
 
-        if ($strip > 0) {
-            $entries = array_diff(scandir($temp_dir), ['.', '..']);
-            if (count($entries) === 1) {
-                $inner = $temp_dir . DIRECTORY_SEPARATOR . reset($entries);
-                if (is_dir($inner)) {
-                    FileSystem::copyDir($inner, $target_path);
-                    FileSystem::removeDir($temp_dir);
-                    return;
-                }
+        $result = $this->passthru($cmd, $this->console_putput, capture_output: true, throw_on_error: false);
+        if ($result['code'] === 0) {
+            return;
+        }
+        if ($this->isSymlinkOnlyExtractFailure($result['output'])) {
+            logger()->warning('Some symbolic links could not be created during extraction and were skipped (not supported on this Windows host). This is harmless for building.');
+            return;
+        }
+        throw new ExecutionException(
+            cmd: $cmd,
+            message: "Command exited with non-zero code: {$result['code']}",
+            code: $result['code'],
+            cd: $this->cd,
+            env: $this->env,
+        );
+    }
+
+    /**
+     * Decide whether an extraction failure was caused solely by symbolic links that could not be
+     * created on Windows. Returns true only when at least one such error is present and no other
+     * error-looking output is found, so genuine extraction failures still propagate.
+     */
+    private function isSymlinkOnlyExtractFailure(string $output): bool
+    {
+        $saw_symlink_error = false;
+        foreach (preg_split('/\r\n|\r|\n/', $output) ?: [] as $line) {
+            $line = trim($line);
+            if ($line === '') {
+                continue;
+            }
+            // bsdtar's trailing summary line; not an error on its own.
+            if (str_contains($line, 'Error exit delayed from previous errors')) {
+                continue;
+            }
+            // The symlink (or other unsupported special file) that Windows refused to create.
+            if (str_contains($line, "Can't create") && str_contains($line, 'Invalid argument')) {
+                $saw_symlink_error = true;
+                continue;
+            }
+            // Any other error-looking line means this was not a clean symlink-only failure.
+            if (preg_match('/\berror\b|cannot|can\'t|failed|denied|no space|not permitted/i', $line)) {
+                return false;
             }
         }
+        return $saw_symlink_error;
+    }
 
-        FileSystem::copyDir($temp_dir, $target_path);
-        FileSystem::removeDir($temp_dir);
+    /**
+     * On Windows the MSYS2 GNU tar comes first in PATH and reads "C:\..." as a remote host:file,
+     * so use the bsdtar shipped with Windows.
+     */
+    private function tarExecutable(): string
+    {
+        return SystemTarget::isUnix() ? 'tar' : '"C:\Windows\System32\tar.exe"';
     }
 }

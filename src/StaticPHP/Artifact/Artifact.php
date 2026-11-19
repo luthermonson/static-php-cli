@@ -288,6 +288,19 @@ class Artifact
     }
 
     /**
+     * Get the binary download config for a platform, defaulting to the current one.
+     *
+     * Custom binary fetchers receive the Artifact, not their own config entry, so this is how
+     * they read extra options such as a `base-url` used to assemble the download URL.
+     */
+    public function getBinaryDownloadConfig(?string $platform = null): ?array
+    {
+        $platform ??= SystemTarget::getCurrentPlatformString();
+        $config = $this->config['binary'][$platform] ?? null;
+        return is_array($config) ? $config : null;
+    }
+
+    /**
      * Get source extraction directory.
      *
      * Rules:
@@ -330,14 +343,13 @@ class Artifact
     }
 
     /**
-     * Get source build root directory.
-     * It's only worked when 'source-root' is defined in artifact config.
-     * Normally it's equal to source dir.
+     * Get the root directory of the buildable source tree.
+     * Equals the source dir unless source.source-root is declared in artifact config.
      */
     public function getSourceRoot(): string
     {
-        if (isset($this->config['metadata']['source-root'])) {
-            return FileSystem::convertPath($this->getSourceDir() . '/' . ltrim($this->config['metadata']['source-root'], '/'));
+        if (isset($this->config['source']['source-root'])) {
+            return FileSystem::convertPath($this->getSourceDir() . '/' . ltrim($this->config['source']['source-root'], '/'));
         }
         return $this->getSourceDir();
     }
@@ -670,7 +682,7 @@ class Artifact
             '{artifact_name}' => $this->name,
             '{pkg_root_path}' => PKG_ROOT_PATH,
             '{build_root_path}' => BUILD_ROOT_PATH,
-            '{php_sdk_path}' => getenv('PHP_SDK_PATH') ?: WORKING_DIR . '/php-sdk-binary-tools',
+            '{spc_msys2_path}' => getenv('SPC_MSYS2_PATH'),
             '{working_dir}' => WORKING_DIR,
             '{download_path}' => DOWNLOAD_PATH,
             '{source_path}' => SOURCE_PATH,

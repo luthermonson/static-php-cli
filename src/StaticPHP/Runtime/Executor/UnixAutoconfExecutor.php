@@ -10,6 +10,7 @@ use StaticPHP\Exception\SPCInternalException;
 use StaticPHP\Package\LibraryPackage;
 use StaticPHP\Package\PackageBuilder;
 use StaticPHP\Package\PackageInstaller;
+use StaticPHP\Package\ToolPackage;
 use StaticPHP\Runtime\Shell\UnixShell;
 use StaticPHP\Runtime\SystemTarget;
 use StaticPHP\Util\InteractiveTerm;
@@ -23,7 +24,7 @@ class UnixAutoconfExecutor extends Executor
 
     protected PackageInstaller $installer;
 
-    public function __construct(protected LibraryPackage $package, ?PackageInstaller $installer = null)
+    public function __construct(protected LibraryPackage|ToolPackage $package, ?PackageInstaller $installer = null)
     {
         parent::__construct($package);
         if ($installer !== null) {
@@ -63,9 +64,15 @@ class UnixAutoconfExecutor extends Executor
      * @param bool         $with_clean     Whether to clean before building
      * @param array        $after_env_vars Environment variables postfix
      */
-    public function make(string $target = '', false|string $with_install = 'install', bool $with_clean = true, array $after_env_vars = [], ?string $dir = null): static
-    {
-        return $this->seekLogFileOnException(function () use ($target, $with_install, $with_clean, $after_env_vars, $dir) {
+    public function make(
+        string $target = '',
+        false|string $with_install = 'install',
+        bool $with_clean = true,
+        array $after_env_vars = [],
+        ?string $dir = null,
+        ?int $concurrency = null
+    ): static {
+        return $this->seekLogFileOnException(function () use ($target, $with_install, $with_clean, $after_env_vars, $dir, $concurrency) {
             $shell = $this->shell;
             if ($dir) {
                 $shell = $shell->cd($dir);
@@ -75,9 +82,9 @@ class UnixAutoconfExecutor extends Executor
                 $shell->exec('make clean');
             }
             $after_env_vars_str = $after_env_vars !== [] ? shell()->setEnv($after_env_vars)->getEnvString() : '';
-            $concurrency = ApplicationContext::get(PackageBuilder::class)->concurrency;
+            $c = $concurrency ?? ApplicationContext::get(PackageBuilder::class)->concurrency;
             InteractiveTerm::setMessage('Building package: ' . ConsoleColor::yellow($this->package->getName()) . ' (make)');
-            $shell->exec("make -j{$concurrency} {$target} {$after_env_vars_str}");
+            $shell->exec("make -j{$c} {$target} {$after_env_vars_str}");
             if ($with_install !== false) {
                 InteractiveTerm::setMessage('Building package: ' . ConsoleColor::yellow($this->package->getName()) . ' (make ' . $with_install . ')');
                 $shell->exec("make {$with_install}");
@@ -118,7 +125,7 @@ class UnixAutoconfExecutor extends Executor
     /**
      * Add configure args.
      */
-    public function addConfigureArgs(...$args): static
+    public function addConfigureArgs(string ...$args): static
     {
         $this->configure_args = [...$this->configure_args, ...$args];
         return $this;
@@ -127,7 +134,7 @@ class UnixAutoconfExecutor extends Executor
     /**
      * Remove some configure args, to bypass the configure option checking for some libs.
      */
-    public function removeConfigureArgs(...$args): static
+    public function removeConfigureArgs(string ...$args): static
     {
         $this->configure_args = array_diff($this->configure_args, $args);
         return $this;

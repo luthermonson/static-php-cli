@@ -20,8 +20,8 @@ class unixodbc extends LibraryPackage
     {
         $sysconf_selector = match ($os = SystemTarget::getTargetOS()) {
             'Darwin' => match (SystemTarget::getTargetArch()) {
-                'x86_64' => '/usr/local/etc',
-                'aarch64' => '/opt/homebrew/etc',
+                'x86_64' => is_dir('/usr/local/etc') ? '/usr/local/etc' : '/opt/local/etc',
+                'aarch64' => is_dir('/opt/homebrew/etc') ? '/opt/homebrew/etc' : '/opt/local/etc',
                 default => throw new WrongUsageException('Unsupported architecture: ' . GNU_ARCH),
             },
             'Linux' => '/etc',
@@ -48,15 +48,9 @@ class unixodbc extends LibraryPackage
                 '--with-included-ltdl',
                 "--sysconfdir={$sysconf_selector}",
                 '--enable-gui=no',
-            );
-
-        // The exe/ subdirectory builds odbcinst/iusql/etc, turn it into a no-op
-        file_put_contents(
-            "{$this->getSourceDir()}/exe/Makefile",
-            ".PHONY: all install clean check distclean install-strip\nall install clean check distclean install-strip:\n\t@true\n",
-        );
-
-        $make->make();
+                '--enable-readline=no',
+            )
+            ->make();
         $this->patchPkgconfPrefix(['odbc.pc', 'odbccr.pc', 'odbcinst.pc']);
         $this->patchLaDependencyPrefix();
     }

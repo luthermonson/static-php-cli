@@ -21,6 +21,7 @@ on:
         default: '8.4'
         type: choice
         options:
+          - '8.5'
           - '8.4'
           - '8.3'
           - '8.2'
@@ -331,5 +332,4 @@ jobs:
         with:
           name: build-meta-${{ inputs.php-version }}-${{ inputs.os }}
           path: |
-            buildroot/build-extensions.json
-            buildroot/build-libraries.json
+            buildroot/build-manifest.json

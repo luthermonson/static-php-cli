@@ -31,12 +31,10 @@ class ArtifactExtractorTest extends TestCase
 
         $reflection = new \ReflectionClass(ArtifactConfig::class);
         $property = $reflection->getProperty('artifact_configs');
-        $property->setAccessible(true);
         $property->setValue(null, []);
 
         $loaderReflection = new \ReflectionClass(ArtifactLoader::class);
         $loaderProperty = $loaderReflection->getProperty('artifacts');
-        $loaderProperty->setAccessible(true);
         $loaderProperty->setValue(null, null);
 
         ApplicationContext::reset();
@@ -51,12 +49,10 @@ class ArtifactExtractorTest extends TestCase
 
         $reflection = new \ReflectionClass(ArtifactConfig::class);
         $property = $reflection->getProperty('artifact_configs');
-        $property->setAccessible(true);
         $property->setValue(null, []);
 
         $loaderReflection = new \ReflectionClass(ArtifactLoader::class);
         $loaderProperty = $loaderReflection->getProperty('artifacts');
-        $loaderProperty->setAccessible(true);
         $loaderProperty->setValue(null, null);
 
         ApplicationContext::reset();
@@ -157,7 +153,6 @@ class ArtifactExtractorTest extends TestCase
         // Pre-populate the extracted map for 'my-pkg' via reflection
         $reflection = new \ReflectionClass(ArtifactExtractor::class);
         $extractedProperty = $reflection->getProperty('extracted');
-        $extractedProperty->setAccessible(true);
         $extractedProperty->setValue($extractor, ['my-pkg' => true]);
 
         $result = $extractor->extract($artifact, false);
@@ -181,11 +176,37 @@ class ArtifactExtractorTest extends TestCase
         // Pre-populate the extracted map so we don't need actual downloads
         $reflection = new \ReflectionClass(ArtifactExtractor::class);
         $extractedProperty = $reflection->getProperty('extracted');
-        $extractedProperty->setAccessible(true);
         $extractedProperty->setValue($extractor, ['my-pkg' => true]);
 
         $result = $extractor->extract('my-pkg', false);
         $this->assertSame(SPC_STATUS_ALREADY_EXTRACTED, $result);
+    }
+
+    public function testExtractLocalSourceUsesLocalDirnameInPlace(): void
+    {
+        ApplicationContext::initialize();
+
+        // A real directory standing in for the user's local source tree.
+        $localDir = $this->tempDir . '/user-local-src';
+        mkdir($localDir, 0755, true);
+        file_put_contents($localDir . '/marker.txt', 'keep me');
+
+        $artifact = new Artifact('local-pkg', ['source' => ['type' => 'local']]);
+
+        $cache = $this->createMock(ArtifactCache::class);
+        $cache->method('getSourceInfo')->willReturn(['cache_type' => 'local', 'dirname' => $localDir]);
+        $cache->method('getBinaryInfo')->willReturn(null);
+        $cache->method('isBinaryDownloaded')->willReturn(false);
+        ApplicationContext::set(ArtifactCache::class, $cache);
+
+        $extractor = new ArtifactExtractor($cache, false);
+        $result = $extractor->extract($artifact, true); // force_source: never pick a binary
+
+        // Local sources are not extracted: the tree lives in place at $cache_info['dirname'].
+        $this->assertSame(SPC_STATUS_ALREADY_EXTRACTED, $result);
+        $this->assertFileExists($localDir . '/marker.txt');
+        $this->assertFalse(is_link($localDir));
+        $this->assertSame(\StaticPHP\Util\FileSystem::convertPath($localDir), $artifact->getSourceDir());
     }
 
     // ==================== Helpers ====================
@@ -204,7 +225,6 @@ class ArtifactExtractorTest extends TestCase
     {
         $reflection = new \ReflectionClass(ArtifactConfig::class);
         $property = $reflection->getProperty('artifact_configs');
-        $property->setAccessible(true);
         $configs = $property->getValue(null) ?? [];
         $configs[$name] = $config;
         $property->setValue(null, $configs);

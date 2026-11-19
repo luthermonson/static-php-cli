@@ -23,12 +23,10 @@ class ArtifactDownloaderTest extends TestCase
         // Reset ArtifactConfig and ArtifactLoader static state
         $reflection = new \ReflectionClass(ArtifactConfig::class);
         $property = $reflection->getProperty('artifact_configs');
-        $property->setAccessible(true);
         $property->setValue(null, []);
 
         $loaderReflection = new \ReflectionClass(ArtifactLoader::class);
         $loaderProperty = $loaderReflection->getProperty('artifacts');
-        $loaderProperty->setAccessible(true);
         $loaderProperty->setValue(null, null);
     }
 
@@ -38,12 +36,10 @@ class ArtifactDownloaderTest extends TestCase
 
         $reflection = new \ReflectionClass(ArtifactConfig::class);
         $property = $reflection->getProperty('artifact_configs');
-        $property->setAccessible(true);
         $property->setValue(null, []);
 
         $loaderReflection = new \ReflectionClass(ArtifactLoader::class);
         $loaderProperty = $loaderReflection->getProperty('artifacts');
-        $loaderProperty->setAccessible(true);
         $loaderProperty->setValue(null, null);
     }
 
@@ -64,7 +60,7 @@ class ArtifactDownloaderTest extends TestCase
     {
         $downloader = new ArtifactDownloader([], false);
 
-        $this->assertSame(0, $downloader->getRetry());
+        $this->assertSame(ArtifactDownloader::DEFAULT_RETRY, $downloader->getRetry());
         $this->assertFalse($downloader->interactive);
         $this->assertEmpty($downloader->getArtifacts());
     }
@@ -85,6 +81,13 @@ class ArtifactDownloaderTest extends TestCase
         $this->assertSame(3, $downloader->getRetry());
     }
 
+    public function testConstructWithExplicitZeroRetryDisablesRetries(): void
+    {
+        $downloader = new ArtifactDownloader(['retry' => 0], false);
+
+        $this->assertSame(0, $downloader->getRetry());
+    }
+
     public function testConstructWithNegativeRetryClampedToZero(): void
     {
         $downloader = new ArtifactDownloader(['retry' => -5], false);
@@ -97,7 +100,7 @@ class ArtifactDownloaderTest extends TestCase
         // prefer-source=true sets default to FETCH_PREFER_SOURCE (0)
         $downloader = new ArtifactDownloader(['prefer-source' => true], false);
 
-        $this->assertSame(0, $downloader->getRetry()); // sanity check, object created fine
+        $this->assertSame(ArtifactDownloader::DEFAULT_RETRY, $downloader->getRetry()); // sanity check, object created fine
     }
 
     public function testConstructWithPreferBinaryBoolOption(): void
@@ -188,11 +191,11 @@ class ArtifactDownloaderTest extends TestCase
 
     // ==================== getRetry ====================
 
-    public function testGetRetryDefaultsToZero(): void
+    public function testGetRetryDefaultsToDefaultRetry(): void
     {
         $downloader = new ArtifactDownloader([], false);
 
-        $this->assertSame(0, $downloader->getRetry());
+        $this->assertSame(ArtifactDownloader::DEFAULT_RETRY, $downloader->getRetry());
     }
 
     public function testGetRetryReturnsConfiguredValue(): void
@@ -343,7 +346,6 @@ class ArtifactDownloaderTest extends TestCase
     {
         $reflection = new \ReflectionClass(ArtifactConfig::class);
         $property = $reflection->getProperty('artifact_configs');
-        $property->setAccessible(true);
         $configs = $property->getValue(null) ?? [];
         $configs[$name] = $config;
         $property->setValue(null, $configs);

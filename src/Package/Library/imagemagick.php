@@ -6,15 +6,90 @@ namespace Package\Library;
 
 use StaticPHP\Attribute\Package\BuildFor;
 use StaticPHP\Attribute\Package\Library;
+use StaticPHP\Exception\EnvironmentException;
 use StaticPHP\Package\LibraryPackage;
 use StaticPHP\Runtime\Executor\UnixAutoconfExecutor;
 use StaticPHP\Runtime\SystemTarget;
 use StaticPHP\Toolchain\Interface\ToolchainInterface;
 use StaticPHP\Util\FileSystem;
+use StaticPHP\Util\System\WindowsUtil;
 
 #[Library('imagemagick')]
 class imagemagick
 {
+    /**
+     * Build a fully static, self-contained ImageMagick 7 (Q16-HDRI, /MT) on Windows using the
+     * official VisualMagick build (the ImageMagick/Windows + Configure + Dependencies repos), which
+     * bundles every delegate. ImageMagick has no autoconf/CMake build on Windows, so this clones the
+     * VisualMagick tree, generates a static x64 solution via the Configure tool, and builds it with
+     * msbuild. The resulting CORE_RL_*.lib static libraries + MagickWand/MagickCore headers are
+     * installed into the build root for ext-imagick to link.
+     *
+     * The VisualMagick tree lives under source/ so bin/spc reset cleans it up like everything
+     * else; override the location with SPC_IMAGEMAGICK_BUILD_DIR.
+     */
+    #[BuildFor('Windows')]
+    public function buildWin(LibraryPackage $lib): void
+    {
+        $work = getenv('SPC_IMAGEMAGICK_BUILD_DIR') ?: SOURCE_PATH . '\imagemagick-win';
+        $configure_release = '2026.05.30.2033';
+        $configure_url = "https://github.com/ImageMagick/Configure/releases/download/{$configure_release}/Configure.Release.x64.exe";
+
+        FileSystem::createDir($work);
+        // Clone the VisualMagick repos (ImageMagick source + Configure + Dependencies + all delegates).
+        if (!is_dir("{$work}\\ImageMagick")) {
+            cmd()->cd($work)->exec(SPC_GIT_EXEC . ' clone --depth 1 https://github.com/ImageMagick/Windows.git .');
+            cmd()->cd($work)->exec('bash clone-repositories.sh --imagemagick7');
+        }
+        // Use the prebuilt Configure tool (building it from source needs the MFC components).
+        default_shell()->executeCurlDownload($configure_url, "{$work}\\Configure\\Configure.Release.x64.exe", retries: 2);
+
+        self::patchCairoWin7MtaUsage($work);
+
+        // Generate a static, /MT (linkRuntime), x64, Q16-HDRI solution with the configs embedded
+        // (zeroConfigurationSupport) and OpenMP off (no vcomp runtime dependency).
+        $ver = WindowsUtil::findVisualStudio();
+        $vs_major = is_array($ver) ? $ver['major_version'] : 'unknown';
+        $vs_arg = match ($vs_major) {
+            '18',
+            '17' => '/VS2022',
+            '16' => '/VS2019',
+            default => throw new EnvironmentException("Current VS version {$vs_major} is not supported yet!"),
+        };
+        cmd()->cd("{$work}\\Configure")
+            ->exec("Configure.Release.x64.exe /noWizard {$vs_arg} /x64 /static /linkRuntime /noOpenMP /zeroConfigurationSupport");
+
+        self::retargetGeneratedProjectsToWindows10($work);
+
+        // x64 IM7 defaults to a 64-bit channel mask, whose magick-baseconfig.h #errors unless the
+        // consuming translation unit is C++. ext-imagick is plain C, so force a 32-bit channel mask
+        // (ample: 32 channels >> RGBA/CMYK) before building, keeping libs and the installed header in sync.
+        FileSystem::replaceFileStr(
+            "{$work}\\ImageMagick\\MagickCore\\magick-baseconfig.h",
+            '#define MAGICKCORE_CHANNEL_MASK_DEPTH 64',
+            '#define MAGICKCORE_CHANNEL_MASK_DEPTH 32'
+        );
+
+        cmd()->cd($work)
+            ->exec('msbuild IM7.Static.x64.sln /m /t:Rebuild /nologo /p:Configuration=Release /p:Platform=x64');
+
+        $artifacts = "{$work}\\Artifacts\\lib";
+        if (!is_dir($artifacts)) {
+            throw new EnvironmentException('ImageMagick VisualMagick build produced no Artifacts/lib; build failed.');
+        }
+        // Install the static libs (flat, onto the build-root lib path) and the public headers.
+        FileSystem::createDir($lib->getLibDir());
+        foreach (glob("{$artifacts}\\CORE_RL_*.lib") as $f) {
+            FileSystem::copy($f, $lib->getLibDir() . '\\' . basename($f));
+        }
+        foreach (['MagickWand', 'MagickCore'] as $dir) {
+            FileSystem::createDir($lib->getIncludeDir() . "\\imagemagick\\{$dir}");
+            foreach (glob("{$work}\\ImageMagick\\{$dir}\\*.h") as $h) {
+                FileSystem::copy($h, $lib->getIncludeDir() . "\\imagemagick\\{$dir}\\" . basename($h));
+            }
+        }
+    }
+
     #[BuildFor('Darwin')]
     #[BuildFor('Linux')]
     public function buildUnix(LibraryPackage $lib, ToolchainInterface $toolchain): void
@@ -35,6 +110,7 @@ class imagemagick
             ->optionalPackage('zlib', ...ac_with_args('zlib'))
             ->optionalPackage('xz', ...ac_with_args('lzma'))
             ->optionalPackage('zstd', ...ac_with_args('zstd'))
+            ->optionalPackage('lcms2', ...ac_with_args('lcms'))
             ->optionalPackage('freetype', ...ac_with_args('freetype'))
             ->optionalPackage('bzip2', ...ac_with_args('bzlib'))
             ->optionalPackage('libjxl', ...ac_with_args('jxl'))
@@ -45,6 +121,9 @@ class imagemagick
                 // implicit --with-gcc-arch
                 // bleeds host cpu features into built binaries
                 '--without-gcc-arch',
+                '--disable-docs',
+                '--without-utilities',
+                '--disable-dpc',
             );
 
         // special: linux-static target needs `-static`
@@ -82,5 +161,69 @@ class imagemagick
             );
         }
         $lib->patchLaDependencyPrefix();
+    }
+
+    /**
+     * cairo 1.18.6 (vendored by ImageMagick) uses the Windows 8+ COM MTA usage API in
+     * cairo-win32-system.c, but the VisualMagick projects are generated with
+     * _WIN32_WINNT=0x0601 (Windows 7), where the Windows SDK hides CO_MTA_USAGE_COOKIE and
+     * CoIncrementMTAUsage behind "NTDDI_VERSION >= NTDDI_WIN8", breaking the static build.
+     *
+     * Those functions are resolved dynamically with GetProcAddress, so only the opaque cookie
+     * type declaration is missing: provide the DECLARE_HANDLE-compatible definition for Win7
+     * targets. No-op when the vendored cairo no longer needs it (patch string not found) and when
+     * the projects were retargeted to Windows 10 with retargetGeneratedProjectsToWindows10().
+     */
+    private static function patchCairoWin7MtaUsage(string $work): void
+    {
+        $file = "{$work}\\Dependencies\\Dependencies\\cairo\\src\\win32\\cairo-win32-system.c";
+        if (!is_file($file)) {
+            return;
+        }
+        FileSystem::replaceFileStr(
+            $file,
+            '#include <stdbool.h>',
+            "#include <stdbool.h>\n\n"
+            . "#if !defined(NTDDI_WIN8) || (NTDDI_VERSION < NTDDI_WIN8)\n"
+            . '/* Windows 7 target: mirror DECLARE_HANDLE(CO_MTA_USAGE_COOKIE) from the Win8+ SDK. */' . "\n"
+            . "struct CO_MTA_USAGE_COOKIE__ { int unused; };\n"
+            . "typedef struct CO_MTA_USAGE_COOKIE__ *CO_MTA_USAGE_COOKIE;\n"
+            . '#endif' . "\n",
+        );
+    }
+
+    /**
+     * Retarget the generated VisualMagick projects from the Configure release's Windows 7 default
+     * (_WIN32_WINNT=0x0601) to Windows 10 (_WIN32_WINNT=0x0A00).
+     *
+     * With _WIN32_WINNT >= _WIN32_WINNT_WIN10 the Windows SDK sets NTDDI_VERSION to
+     * WDK_NTDDI_VERSION instead of deriving it from _WIN32_WINNT, which is what un-hides the
+     * DirectWrite RS1/RS3 declarations cairo needs. Configure writes the definition into every
+     * generated *.vcxproj, so patching those keeps the rest of the generation untouched.
+     *
+     * @param string $work VisualMagick work directory (contains ProjectFiles/)
+     */
+    private static function retargetGeneratedProjectsToWindows10(string $work): void
+    {
+        $project_files = FileSystem::scanDirFiles("{$work}/ProjectFiles");
+        if ($project_files === false) {
+            logger()->debug("No VisualMagick ProjectFiles in {$work}; skipping _WIN32_WINNT retarget");
+            return;
+        }
+
+        $win7_define = '_WIN32_WINNT=0x0601';
+        $win10_define = '_WIN32_WINNT=0x0A00';
+        $retargeted = 0;
+        foreach ($project_files as $project) {
+            if (!str_ends_with($project, '.vcxproj')) {
+                continue;
+            }
+            if (!str_contains(FileSystem::readFile($project), $win7_define)) {
+                continue;
+            }
+            FileSystem::replaceFileStr($project, $win7_define, $win10_define);
+            ++$retargeted;
+        }
+        logger()->debug("Retargeted {$retargeted} VisualMagick project(s) to {$win10_define}");
     }
 }

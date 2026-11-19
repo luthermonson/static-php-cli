@@ -30,38 +30,33 @@ class LibraryPackage extends Package
      */
     private array $customPostinstallActions = [];
 
-    public function isInstalled(): bool
+    /**
+     * Everything the package configuration promises to downstream consumers: static libraries,
+     * headers, pkg-config files and any executables it ships.
+     *
+     * @return string[]
+     */
+    public function getInstallFiles(): array
     {
+        $files = [];
         foreach (PackageConfig::get($this->getName(), 'static-libs', []) as $lib) {
-            $path = FileSystem::isRelativePath($lib) ? "{$this->getLibDir()}/{$lib}" : $lib;
-            if (!file_exists($path)) {
-                return false;
-            }
+            $files[] = FileSystem::isRelativePath($lib) ? "{$this->getLibDir()}/{$lib}" : $lib;
         }
         foreach (PackageConfig::get($this->getName(), 'headers', []) as $header) {
-            $path = FileSystem::isRelativePath($header) ? "{$this->getIncludeDir()}/{$header}" : $header;
-            if (!file_exists($path)) {
-                return false;
-            }
+            $files[] = FileSystem::isRelativePath($header) ? "{$this->getIncludeDir()}/{$header}" : $header;
         }
         if (SystemTarget::getTargetOS() !== 'Windows') {
             foreach (PackageConfig::get($this->getName(), 'pkg-configs', []) as $pc) {
                 if (!str_ends_with($pc, '.pc')) {
                     $pc .= '.pc';
                 }
-                if (!file_exists("{$this->getLibDir()}/pkgconfig/{$pc}")) {
-                    return false;
-                }
+                $files[] = "{$this->getLibDir()}/pkgconfig/{$pc}";
             }
         }
-
         foreach (PackageConfig::get($this->getName(), 'static-bins', []) as $bin) {
-            $path = FileSystem::isRelativePath($bin) ? "{$this->getBinDir()}/{$bin}" : $bin;
-            if (!file_exists($path)) {
-                return false;
-            }
+            $files[] = FileSystem::isRelativePath($bin) ? "{$this->getBinDir()}/{$bin}" : $bin;
         }
-        return true;
+        return $files;
     }
 
     /**
@@ -111,60 +106,6 @@ class LibraryPackage extends Package
             $file = preg_replace('/^libdir=.*$/m', "libdir='" . BUILD_LIB_PATH . "'", $file);
             FileSystem::writeFile($realpath, $file);
         }
-    }
-
-    /**
-     * Get extra CFLAGS for current package.
-     * You need to define the environment variable in the format of {LIBRARY_NAME}_CFLAGS
-     * where {LIBRARY_NAME} is the snake_case name of the library.
-     * For example, for libjpeg, the environment variable should be libjpeg_CFLAGS.
-     */
-    public function getLibExtraCFlags(): string
-    {
-        // get environment variable
-        $env = getenv($this->getSnakeCaseName() . '_CFLAGS') ?: '';
-        // get default c flags
-        $arch_c_flags = getenv('SPC_DEFAULT_CFLAGS') ?: '';
-        if (!empty(getenv('SPC_DEFAULT_CFLAGS')) && !str_contains($env, $arch_c_flags)) {
-            $env .= ' ' . $arch_c_flags;
-        }
-        return trim($env);
-    }
-
-    /**
-     * Get extra CXXFLAGS for current package.
-     * You need to define the environment variable in the format of {LIBRARY_NAME}_CXXFLAGS
-     * where {LIBRARY_NAME} is the snake_case name of the library.
-     * For example, for libjpeg, the environment variable should be libjpeg_CXXFLAGS.
-     */
-    public function getLibExtraCxxFlags(): string
-    {
-        // get environment variable
-        $env = getenv($this->getSnakeCaseName() . '_CXXFLAGS') ?: '';
-        // get default cxx flags
-        $arch_cxx_flags = getenv('SPC_DEFAULT_CXXFLAGS') ?: '';
-        if (!empty(getenv('SPC_DEFAULT_CXXFLAGS')) && !str_contains($env, $arch_cxx_flags)) {
-            $env .= ' ' . $arch_cxx_flags;
-        }
-        return trim($env);
-    }
-
-    /**
-     * Get extra LDFLAGS for current package.
-     * You need to define the environment variable in the format of {LIBRARY_NAME}_LDFLAGS
-     * where {LIBRARY_NAME} is the snake_case name of the library.
-     * For example, for libjpeg, the environment variable should be libjpeg_LDFLAGS.
-     */
-    public function getLibExtraLdFlags(): string
-    {
-        // get environment variable
-        $env = getenv($this->getSnakeCaseName() . '_LDFLAGS') ?: '';
-        // get default ld flags
-        $arch_ld_flags = getenv('SPC_DEFAULT_LDFLAGS') ?: '';
-        if (!empty(getenv('SPC_DEFAULT_LDFLAGS')) && !str_contains($env, $arch_ld_flags)) {
-            $env .= ' ' . $arch_ld_flags;
-        }
-        return trim($env);
     }
 
     /**
@@ -359,20 +300,9 @@ class LibraryPackage extends Package
      */
     public function getStaticLibFiles(): string
     {
-        $config = new SPCConfigUtil(['libs_only_deps' => true, 'absolute_libs' => true]);
-        $res = $config->config([$this->getName()]);
+        $config = new SPCConfigUtil(['no_php' => true, 'libs_only_deps' => true, 'absolute_libs' => true]);
+        $res = $config->configForResolvedBuild([$this->getName()], $this->getInstaller());
         return $res['libs'];
-    }
-
-    /**
-     * Get extra LIBS for current package.
-     * You need to define the environment variable in the format of {LIBRARY_NAME}_LIBS
-     * where {LIBRARY_NAME} is the snake_case name of the library.
-     * For example, for libjpeg, the environment variable should be libjpeg_LIBS.
-     */
-    public function getLibExtraLibs(): string
-    {
-        return getenv($this->getSnakeCaseName() . '_LIBS') ?: '';
     }
 
     /**

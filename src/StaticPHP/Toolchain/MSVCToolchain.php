@@ -14,10 +14,14 @@ class MSVCToolchain implements ToolchainInterface
     public function initEnv(): void
     {
         GlobalEnvManager::addPathIfNotExists(PKG_ROOT_PATH . '\bin');
-        $sdk = getenv('PHP_SDK_PATH');
-        if ($sdk !== false) {
-            GlobalEnvManager::addPathIfNotExists($sdk . '\bin');
-            GlobalEnvManager::addPathIfNotExists($sdk . '\msys2\usr\bin');
+        // msys2-build-essentials: add MSYS2 usr\bin to PATH so that 7za.exe, make, autoconf, etc. are available.
+        // This must be done here because msys2-build-essentials is not a dependency of any library package,
+        // so its path@windows entries are not automatically applied by the package installer at runtime.
+        $msys2_path = getenv('SPC_MSYS2_PATH') ?: (PKG_ROOT_PATH . '\msys2-build-essentials\msys64');
+        if (is_dir($msys2_path)) {
+            GlobalEnvManager::putenv("SPC_MSYS2_PATH={$msys2_path}");
+            GlobalEnvManager::addPathIfNotExists($msys2_path . '\usr\bin');
+            GlobalEnvManager::addPathIfNotExists("{$msys2_path}\\usr\\lib\\p7zip");
         }
         // strawberry-perl
         if (is_dir(PKG_ROOT_PATH . '\strawberry-perl')) {
@@ -42,6 +46,14 @@ class MSVCToolchain implements ToolchainInterface
                 exec('call "' . $vcvarsall . '" x64 > NUL && set', $output);
                 file_put_contents(DOWNLOAD_PATH . '/.vcenv-cache', implode("\n", $output));
             }
+            // The snapshot captures the whole environment, including the SPC_* values that were
+            // active when it was taken. Replaying those would silently revert configuration the
+            // caller changed for the current run (e.g. SPC_CURL_TLS_BACKEND), so keep the
+            // process' own SPC_* values and only import the Visual Studio environment.
+            $output = array_values(array_filter(
+                $output,
+                static fn (string $line): bool => !str_starts_with(strtoupper($line), 'SPC_')
+            ));
             array_map(fn ($x) => putenv($x), $output);
         }
         $after = count(getenv());
@@ -50,9 +62,14 @@ class MSVCToolchain implements ToolchainInterface
         }
     }
 
+    public function getCompilerVersion(): ?string
+    {
+        return getenv('VisualStudioVersion') ?: null;
+    }
+
     public function getCompilerInfo(): ?string
     {
-        if ($vcver = getenv('VisualStudioVersion')) {
+        if ($vcver = $this->getCompilerVersion()) {
             return "Visual Studio {$vcver}";
         }
         return null;

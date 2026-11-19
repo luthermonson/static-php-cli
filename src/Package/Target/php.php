@@ -16,6 +16,7 @@ use StaticPHP\Attribute\Package\ResolveBuild;
 use StaticPHP\Attribute\Package\Stage;
 use StaticPHP\Attribute\Package\Target;
 use StaticPHP\Attribute\Package\Validate;
+use StaticPHP\Attribute\PatchDescription;
 use StaticPHP\Config\PackageConfig;
 use StaticPHP\DI\ApplicationContext;
 use StaticPHP\Exception\WrongUsageException;
@@ -52,7 +53,7 @@ class php extends TargetPackage
     use pgo;
 
     /** @var string[] Supported major PHP versions */
-    public const array SUPPORTED_MAJOR_VERSIONS = ['7.4', '8.0', '8.1', '8.2', '8.3', '8.4', '8.5'];
+    public const array SUPPORTED_MAJOR_VERSIONS = ['7.4', '8.0', '8.1', '8.2', '8.3', '8.4', '8.5', '8.6'];
 
     /**
      * Get PHP version ID from php_version.h
@@ -143,6 +144,7 @@ class php extends TargetPackage
         $package->addBuildOption('disable-opcache-jit', null, null, 'Disable opcache jit');
         $package->addBuildOption('with-config-file-path', null, InputOption::VALUE_REQUIRED, 'Set the path in which to look for php.ini', PHP_OS_FAMILY === 'Windows' ? null : '/usr/local/etc/php');
         $package->addBuildOption('with-config-file-scan-dir', null, InputOption::VALUE_REQUIRED, 'Set the directory to scan for .ini files after reading php.ini', PHP_OS_FAMILY === 'Windows' ? null : '/usr/local/etc/php/conf.d');
+        $package->addBuildOption('with-sysconfdir', null, InputOption::VALUE_REQUIRED, 'Set the sysconfdir (e.g. /etc/php-zts) used by configure (not available on Windows)');
         $package->addBuildOption('with-hardcoded-ini', 'I', InputOption::VALUE_IS_ARRAY | InputOption::VALUE_REQUIRED, 'Patch PHP source code, inject hardcoded INI');
         $package->addBuildOption('enable-zts', null, null, 'Enable thread safe support');
         $package->addBuildOption('no-smoke-test', null, InputOption::VALUE_OPTIONAL, 'Disable smoke test for specific SAPIs, or all if no value provided', false);
@@ -172,8 +174,8 @@ class php extends TargetPackage
             $package->addBuildOption('build-micro', null, null, 'Build micro SAPI');
             $package->addBuildOption('build-cli', null, null, 'Build cli SAPI');
             $package->addBuildOption('build-fpm', null, null, 'Build fpm SAPI (not available on Windows)');
-            $package->addBuildOption('build-embed', null, null, 'Build embed SAPI (not available on Windows)');
-            $package->addBuildOption('build-frankenphp', null, null, 'Build FrankenPHP SAPI (not available on Windows)');
+            $package->addBuildOption('build-embed', null, null, 'Build embed SAPI');
+            $package->addBuildOption('build-frankenphp', null, null, 'Build FrankenPHP SAPI');
             $package->addBuildOption('build-cgi', null, null, 'Build cgi SAPI');
             $package->addBuildOption('build-all', null, null, 'Build all SAPI');
         }
@@ -257,6 +259,13 @@ class php extends TargetPackage
             $installer->addBuildPackage('php-embed');
         }
 
+        // UPX compression: ensure the upx tool package is installed when requested.
+        // upx is a ToolPackage now, so it's installed directly rather than added as a
+        // library dependency (tool packages bypass the DependencyResolver graph).
+        if ($package->getBuildOption('with-upx-pack')) {
+            $installer->addInstallPackage('upx');
+        }
+
         return [...$extensions_pkg, ...$additional_packages];
     }
 
@@ -325,6 +334,49 @@ class php extends TargetPackage
         return $info;
     }
 
+    public function getBuildManifestData(PackageInstaller $installer): array
+    {
+        if ($this->getName() !== 'php') {
+            return [];
+        }
+
+        $all_extensions = [];
+        $static_extensions = [];
+        $shared_extensions = [];
+        foreach ($installer->getResolvedPackages(PhpExtensionPackage::class) as $extension) {
+            $extension_name = $extension->getExtensionName();
+            if ($extension->isBuildStatic() || $extension->isBuildShared()) {
+                $all_extensions[] = $extension_name;
+            }
+            if ($extension->isBuildStatic()) {
+                $static_extensions[] = $extension_name;
+            }
+            if ($extension->isBuildShared()) {
+                $shared_extensions[] = $extension_name;
+            }
+        }
+
+        $sapis = array_values(array_filter([
+            $installer->isPackageResolved('php-cli') ? 'cli' : null,
+            $installer->isPackageResolved('php-fpm') ? 'fpm' : null,
+            $installer->isPackageResolved('php-micro') ? 'micro' : null,
+            $installer->isPackageResolved('php-cgi') ? 'cgi' : null,
+            $installer->isPackageResolved('php-embed') ? 'embed' : null,
+            $installer->isPackageResolved('frankenphp') ? 'frankenphp' : null,
+        ]));
+
+        return [
+            'version' => static::getPHPVersion(return_null_if_failed: true),
+            'thread-safety' => $this->getBuildOption('enable-zts', false) ? 'zts' : 'nts',
+            'sapis' => $sapis,
+            'extensions' => [
+                'all' => $all_extensions,
+                'static' => $static_extensions,
+                'shared' => $shared_extensions,
+            ],
+        ];
+    }
+
     #[BeforeStage('php', 'build')]
     public function beforeBuild(PackageBuilder $builder, Package $package): void
     {
@@ -336,7 +388,7 @@ class php extends TargetPackage
             logger()->info("Adding hardcoded INI [{$source_name} = {$ini_value}]");
         }
         if (!empty($custom_ini)) {
-            ApplicationContext::invoke([SourcePatcher::class, 'patchHardcodedINI'], [$package->getSourceDir(), $custom_ini]);
+            ApplicationContext::invoke([SourcePatcher::class, 'patchHardcodedINI'], ['php_source_dir' => $package->getSourceDir(), 'ini' => $custom_ini]);
         }
 
         // Patch StaticPHP version
@@ -351,6 +403,104 @@ class php extends TargetPackage
 
         // clean old modules that may conflict with the new php build
         FileSystem::removeDir(BUILD_MODULES_PATH);
+    }
+
+    /**
+     * Ensure every resolved extension with an artifact is present in php-src/ext.
+     * Extension sources are extracted to the default source dir (source/{name}); the
+     * in-tree PHP build requires each extension at php-src/ext/{name} with
+     * config.m4/config.w32 directly inside, so link the extension source root into
+     * place before buildconf: a symlink on Unix, an NTFS junction on Windows (with a
+     * plain copy as fallback), so patches always hit the tree actually compiled.
+     *
+     * Existing dirs are classified by markers: a link/junction is our own (refreshed
+     * when its target differs), a .spc-ext-sync marker is our Windows copy fallback
+     * (refreshed), a directory with a configure script is bundled with php-src
+     * (e.g. zip, or imap on PHP < 8.4) and left untouched. Directories without a
+     * configure script (e.g. the ext/imap/tests leftover in PHP 8.4.27 / 8.5.12)
+     * are stubs and get replaced by the extension artifact.
+     */
+    #[BeforeStage('php', 'build')]
+    public function syncExtensionSources(PackageInstaller $installer): void
+    {
+        foreach ($installer->getResolvedPackages(PhpExtensionPackage::class) as $ext) {
+            if ($ext->getArtifact() === null) {
+                continue;
+            }
+            $source_root = $ext->getSourceRoot();
+            if (!is_dir($source_root)) {
+                continue;
+            }
+            $ext_dir = FileSystem::convertPath(SOURCE_PATH . '/php-src/ext/' . $ext->getExtensionName());
+            // shared-only extensions are built by phpize in their own source root and are
+            // never compiled in-tree, so they do not belong in php-src/ext - unlink them from there
+            if (!$ext->isBuildStatic() && !$ext->isBuildWithPhp()) {
+                if (FileSystem::isLink($ext_dir)) {
+                    logger()->debug("Extension [{$ext->getName()}] is shared-only, unlinking {$ext_dir}.");
+                    FileSystem::removeLink($ext_dir);
+                } elseif (is_dir($ext_dir) && file_exists("{$ext_dir}/.spc-ext-sync")) {
+                    FileSystem::removeDir($ext_dir);
+                }
+                continue;
+            }
+            // already in place: bundled with php-src (getBuildDir prefers it for static
+            // builds), extracted directly in-tree, or a correct link/junction
+            if (realpath($ext_dir) === realpath($source_root)) {
+                continue;
+            }
+            if (FileSystem::isLink($ext_dir)) {
+                FileSystem::removeLink($ext_dir);
+            } elseif (is_dir($ext_dir)) {
+                if (!file_exists("{$ext_dir}/.spc-ext-sync") && $ext->hasConfigureScript($ext_dir)) {
+                    // bundled with php-src, keep it
+                    logger()->debug("Extension [{$ext->getName()}] keeps bundled source at {$ext_dir}.");
+                    continue;
+                }
+                // stub dir left by php-src for an unbundled extension, or our stale copy
+                FileSystem::removeDir($ext_dir);
+            }
+            if (PHP_OS_FAMILY === 'Windows') {
+                logger()->debug("Junctioning extension [{$ext->getName()}] source root to {$ext_dir}...");
+                if (!FileSystem::linkDir($source_root, $ext_dir)) {
+                    logger()->notice("Cannot junction extension [{$ext->getName()}] source root, falling back to copy.");
+                    FileSystem::copyDir($source_root, $ext_dir);
+                    FileSystem::writeFile("{$ext_dir}/.spc-ext-sync", $source_root);
+                }
+            } else {
+                logger()->debug("Linking extension [{$ext->getName()}] source root to {$ext_dir}...");
+                symlink($source_root, $ext_dir);
+            }
+        }
+    }
+
+    #[BeforeStage('php', 'build')]
+    #[PatchDescription('Replace XtOffsetOf (removed in PHP 8.6) with offsetof in extension sources')]
+    public function patchExtensionXtOffsetOf(PackageInstaller $installer): void
+    {
+        if (self::getPHPVersionID() < 80600) {
+            return;
+        }
+        foreach ($installer->getResolvedPackages(PhpExtensionPackage::class) as $ext) {
+            // extensions bundled with php-src are already 8.6-clean
+            if ($ext->getArtifact() === null) {
+                continue;
+            }
+            $build_dir = $ext->getBuildDir();
+            if (!is_dir($build_dir)) {
+                continue;
+            }
+            foreach (FileSystem::scanDirFiles($build_dir) ?: [] as $file) {
+                if (!in_array(FileSystem::extname($file), ['c', 'cc', 'cpp', 'cxx', 'h', 'hpp'], true)) {
+                    continue;
+                }
+                $content = FileSystem::readFile($file);
+                if (!str_contains($content, 'XtOffsetOf')) {
+                    continue;
+                }
+                logger()->debug("Replacing XtOffsetOf with offsetof in {$file}");
+                FileSystem::writeFile($file, str_replace('XtOffsetOf', 'offsetof', $content));
+            }
+        }
     }
 
     #[Stage('postInstall')]

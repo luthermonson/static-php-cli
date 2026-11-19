@@ -42,14 +42,15 @@ trait unix
         // php-src patches from micro (reads SPC_MICRO_PATCHES env var)
         SourcePatcher::patchPhpSrc();
 
-        // patch configure.ac for musl and musl-toolchain
+        // patch libc detection for musl and musl-toolchain
         $musl = SystemTarget::getTargetOS() === 'Linux' && SystemTarget::getLibc() === 'musl';
-        FileSystem::backupFile(SOURCE_PATH . '/php-src/configure.ac');
-        FileSystem::replaceFileStr(
-            SOURCE_PATH . '/php-src/configure.ac',
-            'if command -v ldd >/dev/null && ldd --version 2>&1 | grep ^musl >/dev/null 2>&1',
-            'if ' . ($musl ? 'true' : 'false')
-        );
+        foreach (['configure.ac', 'build/php.m4'] as $libc_probe_file) {
+            FileSystem::replaceFileStr(
+                SOURCE_PATH . "/php-src/{$libc_probe_file}",
+                'command -v ldd >/dev/null && ldd --version 2>&1 | grep ^musl >/dev/null 2>&1',
+                $musl ? 'true' : 'false'
+            );
+        }
 
         // let php m4 tools use static pkg-config
         FileSystem::replaceFileStr("{$package->getSourceDir()}/build/php.m4", 'PKG_CHECK_MODULES(', 'PKG_CHECK_MODULES_STATIC(');
@@ -60,7 +61,7 @@ trait unix
         }
 
         if (self::getPHPVersionID() >= 80300 && self::getPHPVersionID() < 80400) {
-            SourcePatcher::patchFile('spc_fix_avx512_cache_before_80400.patch', SOURCE_PATH . '/php-src');
+            SourcePatcher::patchFile('spc_fix_avx512_cache_before_80400.patch', $package->getSourceDir());
         }
     }
 
@@ -116,8 +117,14 @@ trait unix
         if ($option = $package->getBuildOption('with-config-file-scan-dir', false)) {
             $args[] = "--with-config-file-scan-dir={$option}";
         }
+        if ($option = $package->getBuildOption('with-sysconfdir', false)) {
+            $args[] = "--sysconfdir={$option}";
+        }
         // perform enable cli options
-        $args[] = $installer->isPackageResolved('php-cli') ? '--enable-cli' : '--disable-cli';
+        // PHP >= 8.6 links the CLI objects into libphp for do_php_cli()
+        $cli = $installer->isPackageResolved('php-cli')
+            || ($version_id >= 80600 && $installer->isPackageResolved('php-embed'));
+        $args[] = $cli ? '--enable-cli' : '--disable-cli';
         $args[] = $installer->isPackageResolved('php-fpm')
             ? '--enable-fpm' . ($installer->isPackageResolved('libacl') ? ' --with-fpm-acl' : '')
             : '--disable-fpm';
@@ -137,16 +144,41 @@ trait unix
 
         $static_extension_str = $this->makeStaticExtensionString($installer);
 
-        // reuse the same make vars so configure conftest links use the same LIBS (incl. -framework flags)
-        $vars = $this->makeVars($installer);
+        $configure_str = "{$cmd} {$args} {$static_extension_str}";
+        if ($version_id >= 80600) {
+            $configure_str = str_replace('--with-pic', '--enable-pic', $configure_str);
+        }
+
+        // Configure probes need macOS frameworks, but not static libraries that expose polyfills.
+        $config_util = new SPCConfigUtil();
+        $resolved_package_names = array_keys($installer->getResolvedPackages());
+        $libs = SystemTarget::getRuntimeLibs();
+        // Extension configure checks link against static C++ libraries (e.g. -lgearman, -lsnappy),
+        // so the probe link lines need the C++ runtime for the same reason the final link does.
+        if ($libcpp = $config_util->getCppRuntimeLib($resolved_package_names)) {
+            $libs = trim("{$libs} {$libcpp}");
+        }
+        if (SystemTarget::getTargetOS() === 'Darwin') {
+            $frameworks = $config_util->getFrameworksString($resolved_package_names);
+            $libs = trim("{$libs} {$frameworks}");
+
+            // ext/gettext's probe (AC_CHECK_LIB(intl, bindtextdomain)) links the static
+            // libintl.a built by us, which references GNU libiconv symbols
+            // (_libiconv/_libiconv_open) because gettext is configured with
+            // --with-iconv-prefix. macOS libc has no gettext, so the probe cannot fall back
+            // to -lc and fails with "Unable to find required gettext library".
+            if ($installer->isPackageResolved('gettext') && $installer->getLibraryPackage('libiconv') !== null) {
+                $libs = trim("{$libs} -liconv -lcharset");
+            }
+        }
 
         // run ./configure with args
         $this->seekPhpSrcLogFileOnException(fn () => shell()->cd($package->getSourceDir())->setEnv([
             'CFLAGS' => getenv('SPC_CMD_VAR_PHP_MAKE_EXTRA_CFLAGS'),
             'CPPFLAGS' => "-I{$package->getIncludeDir()}",
-            'LDFLAGS' => "-L{$package->getLibDir()}",
-            'LIBS' => $vars['EXTRA_LIBS'] ?? '',
-        ])->exec("{$cmd} {$args} {$static_extension_str}"), $package->getSourceDir());
+            'LDFLAGS' => "-L{$package->getLibDir()} " . getenv('SPC_CMD_VAR_PHP_MAKE_EXTRA_LDFLAGS'),
+            'LIBS' => $libs,
+        ])->exec($configure_str), $package->getSourceDir());
     }
 
     #[BeforeStage('php', [self::class, 'makeForUnix'], 'php')]
@@ -212,6 +244,7 @@ trait unix
     {
         logger()->info('cleaning up php-src build files');
         shell()->cd($package->getSourceDir())->exec('make clean');
+        $this->cleanLinkedExtensionBuildState($package->getSourceDir());
 
         if ($installer->isPackageResolved('php-cli')) {
             $package->runStage([self::class, 'makeCliForUnix']);
@@ -302,27 +335,11 @@ trait unix
                 ->setEnv($vars)
                 ->exec("make -j{$builder->concurrency} {$makeArgs} micro");
 
-            $dst = BUILD_BIN_PATH . '/micro.sfx';
-            $builder->deployBinary($package->getSourceDir() . '/sapi/micro/micro.sfx', $dst);
-            // patch after UPX-ed micro.sfx (Linux only)
-            if (SystemTarget::getTargetOS() === 'Linux' && $builder->getOption('with-upx-pack')) {
-                // cut binary with readelf to remove UPX extra segment
-                [$ret, $out] = shell()->execWithResult("readelf -l {$dst} | awk '/LOAD|GNU_STACK/ {getline; print \\$1, \\$2, \\$3, \\$4, \\$6, \\$7}'");
-                $out[1] = explode(' ', $out[1]);
-                $offset = $out[1][0];
-                if ($ret !== 0 || !str_starts_with($offset, '0x')) {
-                    throw new PatchException('phpmicro UPX patcher', 'Cannot find offset in readelf output');
-                }
-                $offset = hexdec($offset);
-                // remove upx extra wastes
-                file_put_contents($dst, substr(file_get_contents($dst), 0, $offset));
-            }
-            $package->setOutput('Binary path for micro SAPI', $dst);
-            InteractiveTerm::success('Built SAPI: ' . ConsoleColor::green('php-micro'), true, $start);
-        } finally {
-            if ($phar_patched) {
-                SourcePatcher::unpatchMicroPhar();
-            }
+        $dst = BUILD_BIN_PATH . '/micro.sfx';
+        $builder->deployBinary($package->getSourceDir() . '/sapi/micro/micro.sfx', $dst);
+        // patch after UPX-ed micro.sfx (Linux only)
+        if (SystemTarget::getTargetOS() === 'Linux' && $builder->getOption('with-upx-pack')) {
+            self::patchMicroUpxPackedBinary($dst);
         }
     }
 
@@ -439,6 +456,7 @@ trait unix
 
             FileSystem::replaceFileLineContainsString(BUILD_BIN_PATH . '/php-config', 'extension_dir=', 'extension_dir="' . BUILD_MODULES_PATH . '"');
             FileSystem::replaceFileStr(BUILD_LIB_PATH . '/php/build/phpize.m4', 'test "[$]$1" = "no" && $1=yes', '# test "[$]$1" = "no" && $1=yes');
+            $this->installRemovedMacroCompatHeader();
         }
 
         try {
@@ -656,7 +674,7 @@ trait unix
         copy(ROOT_DIR . '/src/globals/common-tests/embed.c', $sample_file_path . '/embed.c');
         copy(ROOT_DIR . '/src/globals/common-tests/embed.php', $sample_file_path . '/embed.php');
 
-        $config = new SPCConfigUtil()->config($installer->getAvailableResolvedPackageNames());
+        $config = new SPCConfigUtil()->configForResolvedBuild(['php'], $installer);
         $lens = "{$config['cflags']} {$config['ldflags']} {$config['libs']}";
         if ($toolchain->isStatic()) {
             $lens .= ' -static';
@@ -702,6 +720,42 @@ trait unix
     }
 
     /**
+     * Remove build artifacts that `make clean` cannot reach.
+     *
+     * Extension sources are linked into php-src/ext (symlinks on Unix, junctions on Windows), so
+     * the `find` commands of `make clean` do not descend into them: *.lo/*.o/*.dep files from an
+     * earlier build survive. Stale .dep files are not just garbage - they carry absolute header
+     * prerequisites of the tree that produced them, so a build after a PHP version switch can
+     * fail with "No rule to make target .../main/php_config.h" (or silently reuse stale objects).
+     *
+     * @param string $php_src_dir The extracted php-src directory
+     */
+    protected function cleanLinkedExtensionBuildState(string $php_src_dir): void
+    {
+        $php_src_dir = FileSystem::convertPath($php_src_dir);
+        $php_src_real = realpath($php_src_dir);
+        if ($php_src_real === false) {
+            return;
+        }
+        $php_src_prefix = rtrim(FileSystem::convertPath($php_src_real), '/\\') . DIRECTORY_SEPARATOR;
+
+        foreach (glob($php_src_dir . '/ext/*') ?: [] as $link_dir) {
+            if (!FileSystem::isLink($link_dir)) {
+                continue;
+            }
+            $target = realpath($link_dir);
+            if ($target === false) {
+                continue;
+            }
+            $target = FileSystem::convertPath($target);
+            if (str_starts_with($target . DIRECTORY_SEPARATOR, $php_src_prefix)) {
+                continue;
+            }
+            self::removeExtensionBuildArtifacts($target);
+        }
+    }
+
+    /**
      * Seek php-src/config.log when building PHP, add it to exception.
      */
     protected function seekPhpSrcLogFileOnException(callable $callback, string $source_dir): void
@@ -738,12 +792,214 @@ trait unix
     }
 
     /**
+     * Recursively delete libtool/compiler build artifacts (*.lo, *.o, *.dep, *.la, .libs/) inside
+     * an out-of-tree extension source root. Links themselves are left untouched.
+     *
+     * @param string $dir Directory to clean
+     */
+    private static function removeExtensionBuildArtifacts(string $dir): void
+    {
+        foreach (scandir($dir) ?: [] as $item) {
+            if ($item === '.' || $item === '..' || $item === '.git') {
+                continue;
+            }
+            $path = $dir . DIRECTORY_SEPARATOR . $item;
+            if (is_link($path)) {
+                continue;
+            }
+            if (is_dir($path)) {
+                if ($item === '.libs') {
+                    FileSystem::removeDir($path);
+                    continue;
+                }
+                self::removeExtensionBuildArtifacts($path);
+                continue;
+            }
+            if (preg_match('/\.(?:lo|o|dep|la)$/', $item) === 1) {
+                @unlink($path);
+            }
+        }
+    }
+
+    /**
+     * Remove the extra segment appended by UPX when packing phpmicro.
+     */
+    private static function patchMicroUpxPackedBinary(string $binaryPath): void
+    {
+        [$ret, $out] = shell()->execWithResult('readelf -W -l ' . escapeshellarg($binaryPath));
+        if ($ret !== 0) {
+            throw new PatchException('phpmicro UPX patcher', 'Cannot find offset in readelf output');
+        }
+
+        $fileSizes = [];
+        foreach ($out as $index => $line) {
+            $line = trim($line);
+            if (!preg_match('/^(LOAD|GNU_STACK)\s+/', $line)) {
+                continue;
+            }
+
+            $columns = preg_split('/\s+/', $line);
+            if (isset($columns[4]) && preg_match('/^0x[[:xdigit:]]+$/', $columns[4]) === 1) {
+                $fileSizes[] = $columns[4];
+                continue;
+            }
+
+            $next = $out[$index + 1] ?? '';
+            if (preg_match('/^\s*(0x[[:xdigit:]]+)\s+0x[[:xdigit:]]+/', $next, $matches)) {
+                $fileSizes[] = $matches[1];
+            }
+        }
+
+        $offset = $fileSizes[1] ?? null;
+        if ($offset === null) {
+            throw new PatchException('phpmicro UPX patcher', 'Cannot find offset in readelf output');
+        }
+
+        file_put_contents($binaryPath, substr(file_get_contents($binaryPath), 0, intval(hexdec($offset))));
+    }
+
+    /**
+     * Rename libphp.so to libphp-<release>.so if -release is set in LDFLAGS.
+     */
+    private function processLibphpSoFile(string $libphpSo, PackageInstaller $installer): void
+    {
+        $ldflags = getenv('SPC_CMD_VAR_PHP_MAKE_EXTRA_LDFLAGS') ?: '';
+        $libDir = BUILD_LIB_PATH;
+        $modulesDir = BUILD_MODULES_PATH;
+        $realLibName = 'libphp.so';
+        $cwd = getcwd();
+
+        if (preg_match('/-release\s+(\S+)/', $ldflags, $matches)) {
+            $release = $matches[1];
+            $realLibName = "libphp-{$release}.so";
+            $libphpRelease = "{$libDir}/{$realLibName}";
+            if (!file_exists($libphpRelease) && file_exists($libphpSo)) {
+                rename($libphpSo, $libphpRelease);
+            }
+            if (file_exists($libphpRelease)) {
+                chdir($libDir);
+                if (file_exists($libphpSo)) {
+                    unlink($libphpSo);
+                }
+                symlink($realLibName, 'libphp.so');
+                shell()->exec(sprintf(
+                    'patchelf --set-soname %s %s',
+                    escapeshellarg($realLibName),
+                    escapeshellarg($libphpRelease)
+                ));
+            }
+            if (is_dir($modulesDir)) {
+                chdir($modulesDir);
+                foreach ($installer->getResolvedPackages(PhpExtensionPackage::class) as $ext) {
+                    if (!$ext->isBuildShared()) {
+                        continue;
+                    }
+                    $name = $ext->getName();
+                    $versioned = "{$name}-{$release}.so";
+                    $unversioned = "{$name}.so";
+                    $src = "{$modulesDir}/{$versioned}";
+                    $dst = "{$modulesDir}/{$unversioned}";
+                    if (is_file($src)) {
+                        rename($src, $dst);
+                        shell()->exec(sprintf(
+                            'patchelf --set-soname %s %s',
+                            escapeshellarg($unversioned),
+                            escapeshellarg($dst)
+                        ));
+                    }
+                }
+            }
+            chdir($cwd);
+        }
+
+        $target = "{$libDir}/{$realLibName}";
+        if (file_exists($target)) {
+            [, $output] = shell()->execWithResult('readelf -d ' . escapeshellarg($target));
+            $output = implode("\n", $output);
+            if (preg_match('/SONAME.*\[(.+)]/', $output, $sonameMatch)) {
+                $currentSoname = $sonameMatch[1];
+                if ($currentSoname !== basename($target)) {
+                    shell()->exec(sprintf(
+                        'patchelf --set-soname %s %s',
+                        escapeshellarg(basename($target)),
+                        escapeshellarg($target)
+                    ));
+                }
+            }
+        }
+    }
+
+    /**
+     * PHP 8.6 dropped a batch of long-deprecated aliases
+     */
+    private function installRemovedMacroCompatHeader(): void
+    {
+        if (php::getPHPVersionID() < 80600) {
+            return;
+        }
+        $header = BUILD_ROOT_PATH . '/include/php/main/php.h';
+        if (!file_exists($header) || str_contains((string) file_get_contents($header), 'SPC_REMOVED_MACRO_COMPAT')) {
+            return;
+        }
+        FileSystem::writeFile($header, <<<'C'
+
+            #ifndef SPC_REMOVED_MACRO_COMPAT
+            #define SPC_REMOVED_MACRO_COMPAT
+            #ifndef XtOffsetOf
+            # define XtOffsetOf(s_type, field) offsetof(s_type, field)
+            #endif
+            #ifndef ZVAL_IS_NULL
+            # define ZVAL_IS_NULL(z) (Z_TYPE_P(z) == IS_NULL)
+            #endif
+            #ifndef zval_dtor
+            # define zval_dtor(zvalue) zval_ptr_dtor_nogc(zvalue)
+            #endif
+            #ifndef zval_is_true
+            # define zval_is_true(op) zend_is_true(op)
+            #endif
+            #ifndef INI_INT
+            # define INI_INT(name) zend_ini_long((name), strlen(name), 0)
+            #endif
+            #ifndef INI_FLT
+            # define INI_FLT(name) zend_ini_double((name), strlen(name), 0)
+            #endif
+            #ifndef INI_STR
+            # define INI_STR(name) zend_ini_string_ex((name), strlen(name), 0, NULL)
+            #endif
+            #ifndef INI_BOOL
+            # define INI_BOOL(name) ((bool) INI_INT(name))
+            #endif
+            #ifndef ZEND_PARSE_PARAMS_THROW
+            # define ZEND_PARSE_PARAMS_THROW 0
+            #endif
+            #ifndef EMPTY_SWITCH_DEFAULT_CASE
+            # define EMPTY_SWITCH_DEFAULT_CASE() default: ZEND_UNREACHABLE(); break;
+            #endif
+            #ifndef zend_parse_parameters_throw
+            # define zend_parse_parameters_throw(num_args, ...) zend_parse_parameters(num_args, __VA_ARGS__)
+            #endif
+            #ifndef ZEND_WRONG_PARAM_COUNT
+            # define ZEND_WRONG_PARAM_COUNT() { zend_wrong_param_count(); return; }
+            #endif
+            #ifndef WRONG_PARAM_COUNT
+            # define WRONG_PARAM_COUNT ZEND_WRONG_PARAM_COUNT()
+            #endif
+            #ifndef OPENBASEDIR_CHECKPATH
+            # define OPENBASEDIR_CHECKPATH(filename) php_check_open_basedir(filename)
+            #endif
+            #endif
+
+            C, FILE_APPEND);
+        logger()->info('Restored macros removed in PHP 8.6 for phpize builds');
+    }
+
+    /**
      * Make environment variables for php make.
      * This will call SPCConfigUtil to generate proper LDFLAGS and LIBS for static linking.
      */
     private function makeVars(PackageInstaller $installer): array
     {
-        $config = new SPCConfigUtil(['libs_only_deps' => true])->config($installer->getAvailableResolvedPackageNames());
+        $config = new SPCConfigUtil(['libs_only_deps' => true])->configForResolvedBuild(['php'], $installer);
         $static = ApplicationContext::get(ToolchainInterface::class)->isStatic() ? '-all-static' : '';
         $pie = SystemTarget::getTargetOS() === 'Linux' ? '-pie' : '';
         $lib = BUILD_LIB_PATH;

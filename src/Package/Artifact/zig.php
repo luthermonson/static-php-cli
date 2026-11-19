@@ -11,6 +11,7 @@ use StaticPHP\Attribute\Artifact\AfterBinaryExtract;
 use StaticPHP\Attribute\Artifact\CustomBinary;
 use StaticPHP\Attribute\Artifact\CustomBinaryCheckUpdate;
 use StaticPHP\Exception\DownloaderException;
+use StaticPHP\Exception\SPCInternalException;
 use StaticPHP\Runtime\SystemTarget;
 
 class zig
@@ -102,32 +103,42 @@ class zig
     ])]
     public function postExtractZig(string $target_path): void
     {
-        $files = ['zig', 'zig-cc', 'zig-c++', 'zig-ar', 'zig-ld.lld', 'zig-ranlib', 'zig-objcopy'];
-        $all_exist = true;
-        foreach ($files as $file) {
-            if (!file_exists("{$target_path}/{$file}")) {
-                $all_exist = false;
-                break;
-            }
-        }
-        if (!$all_exist) {
-            $script_path = ROOT_DIR . '/src/globals/scripts/zig-cc.sh';
-            $script_content = file_get_contents($script_path);
+        self::writeWrappers($target_path);
+    }
 
-            file_put_contents("{$target_path}/zig-cc", $script_content);
-            chmod("{$target_path}/zig-cc", 0755);
-
-            $script_content = str_replace('zig cc', 'zig c++', $script_content);
-            file_put_contents("{$target_path}/zig-c++", $script_content);
-            file_put_contents("{$target_path}/zig-ar", "#!/usr/bin/env bash\nexec zig ar $@");
-            file_put_contents("{$target_path}/zig-ld.lld", "#!/usr/bin/env bash\nexec zig ld.lld $@");
-            file_put_contents("{$target_path}/zig-ranlib", "#!/usr/bin/env bash\nexec zig ranlib $@");
-            file_put_contents("{$target_path}/zig-objcopy", "#!/usr/bin/env bash\nexec zig objcopy $@");
-            chmod("{$target_path}/zig-c++", 0755);
-            chmod("{$target_path}/zig-ar", 0755);
-            chmod("{$target_path}/zig-ld.lld", 0755);
-            chmod("{$target_path}/zig-ranlib", 0755);
-            chmod("{$target_path}/zig-objcopy", 0755);
+    public static function writeWrappers(string $target_path): void
+    {
+        $script_path = ROOT_DIR . '/src/globals/scripts/zig-cc.sh';
+        // Guarded: an unreadable template used to write empty wrapper scripts, which only fails much
+        // later with an unrelated-looking error during configure.
+        $script_content = is_file($script_path) ? file_get_contents($script_path) : false;
+        if ($script_content === false) {
+            throw new SPCInternalException("Missing zig wrapper template at {$script_path}");
         }
+
+        $files = ['zig-cc', 'zig-c++', 'zig-ar', 'zig-ld.lld', 'zig-ranlib', 'zig-objcopy'];
+        // Nothing to do when the wrapper matches the current template and the whole set is present.
+        // Checked with is_file() instead of a silenced read: SPC's error handler logs PHP warnings
+        // even when they carry the @ operator, so a normal first-time install printed a warning
+        // about the very wrapper it was about to create.
+        $current = is_file("{$target_path}/zig-cc") ? file_get_contents("{$target_path}/zig-cc") : false;
+        if ($current === $script_content && array_all($files, fn ($file) => file_exists("{$target_path}/{$file}"))) {
+            return;
+        }
+
+        file_put_contents("{$target_path}/zig-cc", $script_content);
+        chmod("{$target_path}/zig-cc", 0755);
+
+        $script_content = str_replace('zig cc', 'zig c++', $script_content);
+        file_put_contents("{$target_path}/zig-c++", $script_content);
+        file_put_contents("{$target_path}/zig-ar", "#!/usr/bin/env bash\nexec zig ar $@");
+        file_put_contents("{$target_path}/zig-ld.lld", "#!/usr/bin/env bash\nexec zig ld.lld $@");
+        file_put_contents("{$target_path}/zig-ranlib", "#!/usr/bin/env bash\nexec zig ranlib $@");
+        file_put_contents("{$target_path}/zig-objcopy", "#!/usr/bin/env bash\nexec zig objcopy $@");
+        chmod("{$target_path}/zig-c++", 0755);
+        chmod("{$target_path}/zig-ar", 0755);
+        chmod("{$target_path}/zig-ld.lld", 0755);
+        chmod("{$target_path}/zig-ranlib", 0755);
+        chmod("{$target_path}/zig-objcopy", 0755);
     }
 }

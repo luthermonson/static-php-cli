@@ -22,4 +22,30 @@ class clickhouse extends PhpExtensionPackage
         }
         return $arg;
     }
+
+    #[BeforeStage('php', [php::class, 'buildconfForUnix'], 'ext-clickhouse')]
+    #[PatchDescription('Remove Darwin -exported_symbol ldflag from clickhouse config.m4 that breaks static conftests')]
+    public function patchBeforeBuildconf(): void
+    {
+        // upstream config.m4 appends -Wl,-exported_symbol,_get_module to the global LDFLAGS on
+        // Darwin (meant for shared builds); in static in-tree builds this makes every later
+        // configure conftest fail to link with "Undefined symbols: _get_module"
+        if ($this->isBuildStatic()) {
+            FileSystem::replaceFileStr(
+                $this->getBuildDir() . '/config.m4',
+                'LDFLAGS="$LDFLAGS -Wl,-exported_symbol,_get_module"',
+                ''
+            );
+        }
+
+        // upstream checks libssl with PHP_CHECK_LIBRARY(ssl, SSL_CTX_new) without naming the
+        // libraries libssl.a itself depends on, so the conftest fails with undefined libcrypto
+        // symbols for static builds: configure aborts with "requires libssl, which was not found".
+        // Preload libcrypto/libz into LIBS for that check (it is guarded by --enable-clickhouse-openssl).
+        FileSystem::replaceFileStr(
+            $this->getBuildDir() . '/config.m4',
+            '    PHP_CHECK_LIBRARY(ssl, SSL_CTX_new, [',
+            '    LIBS="$LIBS -lcrypto -lz"' . "\n" . '    PHP_CHECK_LIBRARY(ssl, SSL_CTX_new, ['
+        );
+    }
 }

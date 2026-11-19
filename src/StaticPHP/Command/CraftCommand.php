@@ -41,6 +41,15 @@ class CraftCommand extends BaseCommand
         // set verbosity
         $this->output->setVerbosity($craft['verbosity']);
 
+        // sync logger level and ApplicationContext debug mode to match the new verbosity
+        $level = match ($this->output->getVerbosity()) {
+            OutputInterface::VERBOSITY_VERBOSE => 'info',
+            OutputInterface::VERBOSITY_VERY_VERBOSE, OutputInterface::VERBOSITY_DEBUG => 'debug',
+            default => 'warning',
+        };
+        logger()->setLevel($level);
+        ApplicationContext::setDebug($this->output->getVerbosity() >= OutputInterface::VERBOSITY_DEBUG);
+
         // apply env
         array_walk($craft['extra-env'], fn ($v, $k) => f_putenv("{$k}={$v}"));
 
@@ -162,7 +171,7 @@ class CraftCommand extends BaseCommand
      *     shared-extensions: array<string>,
      *     packages: array<string>,
      *     sapi: array<string>,
-     *     verbosity: int,
+     *     verbosity: 128|16|256|32|64|8,
      *     debug: bool,
      *     clean-build: bool,
      *     build-options: array<string, mixed>,
@@ -189,8 +198,8 @@ class CraftCommand extends BaseCommand
         }
 
         // check php-version
-        if (isset($craft['php-version']) && !preg_match('/^(\d+)(\.\d+)?(\.\d+)?$/', strval($craft['php-version']))) {
-            throw new ValidationException("Craft file '{$craft_file}' has invalid 'php-version' field, it should be in format of '8.0.0'.");
+        if (isset($craft['php-version']) && !preg_match('/^(\d+)(\.\d+)?(\.\d+)?(?:(?:alpha|beta|RC)\d+)?$/', strval($craft['php-version']))) {
+            throw new ValidationException("Craft file '{$craft_file}' has invalid 'php-version' field, it should be in format of '8.0.0' or '8.6.0RC1'.");
         }
 
         // check php extensions field
@@ -223,11 +232,16 @@ class CraftCommand extends BaseCommand
         }
 
         // verbosity
-        $verbosity_level = $craft['verbosity'] ?? OutputInterface::VERBOSITY_NORMAL;
         $debug = $craft['debug'] ?? false;
-        if ($debug) {
-            $verbosity_level = OutputInterface::VERBOSITY_DEBUG;
-        }
+        $verbosity_level = $debug
+            ? OutputInterface::VERBOSITY_DEBUG
+            : match ((int) ($craft['verbosity'] ?? 0)) {
+                OutputInterface::VERBOSITY_QUIET => OutputInterface::VERBOSITY_QUIET,
+                OutputInterface::VERBOSITY_VERBOSE => OutputInterface::VERBOSITY_VERBOSE,
+                OutputInterface::VERBOSITY_VERY_VERBOSE => OutputInterface::VERBOSITY_VERY_VERBOSE,
+                OutputInterface::VERBOSITY_DEBUG => OutputInterface::VERBOSITY_DEBUG,
+                default => OutputInterface::VERBOSITY_NORMAL,
+            };
         $craft['verbosity'] = $verbosity_level;
 
         // clean-build (if true, reset before all builds)

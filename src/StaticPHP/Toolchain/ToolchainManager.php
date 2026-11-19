@@ -41,10 +41,31 @@ class ToolchainManager
             'Windows' => MSVCToolchain::class,
             'Darwin' => match (getenv('SPC_USE_LLVM') ?: 'system') {
                 'brew' => ClangBrewToolchain::class,
+                'port' => ClangPortsToolchain::class,
                 default => ClangNativeToolchain::class,
             },
             default => throw new WrongUsageException('Unsupported OS family: ' . PHP_OS_FAMILY),
         };
+    }
+
+    /**
+     * Get the active toolchain instance, or null when it cannot be resolved.
+     *
+     * The single place that knows how to reach the toolchain in the container: initToolchain()
+     * registers it during bootstrap, so a null result means the container was not initialised
+     * (unit tests reset it) rather than a broken environment.
+     */
+    public static function getToolchain(): ?ToolchainInterface
+    {
+        if (!ApplicationContext::has(ToolchainInterface::class)) {
+            return null;
+        }
+        try {
+            return ApplicationContext::get(ToolchainInterface::class);
+        } catch (\Throwable $e) {
+            logger()->debug('Cannot resolve the active toolchain: ' . $e->getMessage());
+            return null;
+        }
     }
 
     /**
@@ -88,6 +109,7 @@ class ToolchainManager
         /* @var ToolchainInterface $toolchain */
         $instance = ApplicationContext::get(ToolchainInterface::class);
         $instance->afterInit();
+
         if (getenv('PHP_BUILD_COMPILER') === false && ($compiler_info = $instance->getCompilerInfo())) {
             GlobalEnvManager::putenv("PHP_BUILD_COMPILER={$compiler_info}");
         }

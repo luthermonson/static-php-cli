@@ -2,14 +2,19 @@ ext-zip:
   type: php-extension
   artifact:
     source:
-      type: pecl
-      name: zip
+      type: pie
+      repo: pecl/zip
       extract: ext-zip
     metadata:
       license-files: [LICENSE]
       license: PHP-3.01
   depends:
     - libzip
+  depends@windows:
+    - libzip
+    - zlib
+    - xz
+    - bzip2
   php-extension:
     arg-type: custom
     arg-type@windows: enable

@@ -11,9 +11,13 @@ use StaticPHP\Artifact\ArtifactExtractor;
 use StaticPHP\Artifact\DownloaderOptions;
 use StaticPHP\Config\PackageConfig;
 use StaticPHP\DI\ApplicationContext;
+use StaticPHP\Exception\EnvironmentException;
 use StaticPHP\Exception\WrongUsageException;
 use StaticPHP\Registry\PackageLoader;
 use StaticPHP\Runtime\SystemTarget;
+use StaticPHP\Toolchain\Interface\PackageRequirementsInterface;
+use StaticPHP\Toolchain\ToolchainManager;
+use StaticPHP\Util\BuildManifestDumper;
 use StaticPHP\Util\BuildRootTracker;
 use StaticPHP\Util\DependencyResolver;
 use StaticPHP\Util\DirDiff;
@@ -40,6 +44,9 @@ class PackageInstaller
 
     /** @var array<string, array<string>> Unresolved target additional dependencies defined in #[ResolveBuild] */
     protected array $target_additional_dependencies = [];
+
+    /** @var bool Whether this run compiles something and therefore needs the toolchain packages */
+    protected bool $toolchain_packages_required = false;
 
     /** @var bool Whether to download missing sources automatically */
     protected bool $download = true;
@@ -75,6 +82,9 @@ class PackageInstaller
         }
         // special check for php target packages
         if (in_array($package->getName(), ['php', 'php-cli', 'php-fpm', 'php-micro', 'php-cgi', 'php-embed', 'frankenphp'], true)) {
+            if (!$package instanceof TargetPackage) {
+                throw new WrongUsageException("Package '{$package->getName()}' is expected to be a TargetPackage.");
+            }
             $this->handlePhpTargetPackage($package);
             return $this;
         }
@@ -117,6 +127,36 @@ class PackageInstaller
     public function setDownload(bool $download = true): static
     {
         $this->download = $download;
+        return $this;
+    }
+
+    /**
+     * Prefer binary artifacts for the given packages instead of the global default
+     * (which is source). If no binary is available for the current platform, or its
+     * download fails, the downloader still falls back to source.
+     *
+     * This is the programmatic equivalent of `--dl-prefer-binary=pkg1,pkg2`, used by
+     * packages whose binary is hosted but whose source build is only a fallback.
+     *
+     * @param string ...$packages Package/artifact names
+     */
+    public function preferBinary(string ...$packages): static
+    {
+        // Symfony returns null (not true) for an optional option given without a value,
+        // and false when it was not given at all.
+        $current = array_key_exists('dl-prefer-binary', $this->options) ? $this->options['dl-prefer-binary'] : false;
+        if ($current === true || $current === null) {
+            return $this; // already preferred globally
+        }
+
+        // An explicit source-only request must keep winning over our binary preference.
+        $source_only = array_key_exists('dl-source-only', $this->options) ? $this->options['dl-source-only'] : false;
+        if ($source_only === true || $source_only === null || is_string($source_only) && $source_only !== '') {
+            return $this;
+        }
+
+        $names = is_string($current) && $current !== '' ? parse_comma_list($current) : [];
+        $this->options['dl-prefer-binary'] = implode(',', array_values(array_unique([...$names, ...$packages])));
         return $this;
     }
 
@@ -174,7 +214,7 @@ class PackageInstaller
             // These must always download binary (not source), regardless of global prefer-source setting.
             $binary_only_packages = array_filter(
                 $this->packages,
-                fn ($p) => $p instanceof LibraryPackage
+                fn ($p) => ($p instanceof LibraryPackage || $p instanceof ToolPackage)
                     && !$this->isBuildPackage($p)
                     && !$p->hasStage('build')
                     && ($p->getArtifact()?->hasPlatformBinary() ?? false)
@@ -184,7 +224,12 @@ class PackageInstaller
                 'source-only' => implode(',', array_map(fn ($x) => $x->getName(), $this->build_packages)),
             ];
             if ($binary_only_packages !== []) {
-                $dl_opts['binary-only'] = implode(',', array_map(fn ($x) => $x->getName(), $binary_only_packages));
+                // Merged rather than replaced: a caller's global binary-only (the doctor's pkg-config
+                // fix) has to stay global when the toolchain adds a binary-only package such as zig.
+                $dl_opts['binary-only'] = DownloaderOptions::addToList(
+                    $dl_opts['binary-only'] ?? false,
+                    array_map(fn ($x) => $x->getName(), $binary_only_packages)
+                );
             }
             $downloader = new ArtifactDownloader($dl_opts, $this->interactive);
             $downloader->addArtifacts($this->getArtifacts())->download();
@@ -212,8 +257,8 @@ class PackageInstaller
         $builder = ApplicationContext::get(PackageBuilder::class);
         foreach ($this->packages as $package) {
             $is_to_build = $this->isBuildPackage($package);
-            $has_build_stage = $package instanceof LibraryPackage && $package->hasStage('build');
-            $should_use_binary = $package instanceof LibraryPackage && ($package->getArtifact()?->shouldUseBinary() ?? false);
+            $has_build_stage = ($package instanceof LibraryPackage || $package instanceof ToolPackage) && $package->hasStage('build');
+            $should_use_binary = ($package instanceof LibraryPackage || $package instanceof ToolPackage) && ($package->getArtifact()?->shouldUseBinary() ?? false);
             $has_source = $package->hasSource();
             if (!$is_to_build && $should_use_binary) {
                 // install binary
@@ -276,6 +321,19 @@ class PackageInstaller
 
         // perform after-install actions and emit post-install events
         $this->emitPostInstallEvents();
+
+        // Final verification: declared build-time tools should have been auto-installed by the
+        // pipeline above (they were merged into $this->packages in resolvePackages()). This only
+        // throws if a tool genuinely failed to become available (e.g. no artifact for this platform).
+        $this->ensureRequiredTools();
+
+        // Packages the toolchain could not declare before this run installed its prerequisite.
+        $this->warnAboutMissingToolchainPackages();
+
+        // Pure install operations must not overwrite the manifest of an existing build.
+        if ($this->build_packages !== []) {
+            new BuildManifestDumper()->dump($this->packages, $this->build_packages, $this->install_packages, $this);
+        }
     }
 
     public function isBuildPackage(Package|string $package): bool
@@ -303,32 +361,6 @@ class PackageInstaller
         return isset($this->packages[$package_name]);
     }
 
-    /**
-     * Get resolved package names filtered to only packages whose build artifacts are available.
-     * This excludes library packages that haven't been built/installed yet, which naturally
-     * prevents SPCConfigUtil from checking static-lib files of libraries that come after
-     * the current target in the build order (e.g. 'watcher' for frankenphp isn't built
-     * when 'php' is being compiled).
-     *
-     * @return string[] Available resolved package names
-     */
-    public function getAvailableResolvedPackageNames(): array
-    {
-        return array_values(array_filter(
-            array_keys($this->packages),
-            function (string $name): bool {
-                $pkg = $this->packages[$name] ?? null;
-                // Exclude library packages whose build artifacts don't exist yet.
-                // Extensions and targets are not filtered — extensions are compiled into PHP
-                // and don't have standalone build artifacts.
-                if ($pkg instanceof LibraryPackage && $pkg->getType() === 'library' && !$pkg->isInstalled()) {
-                    return false;
-                }
-                return true;
-            }
-        ));
-    }
-
     public function isPackageInstalled(Package|string $package_name): bool
     {
         if (empty($this->packages)) {
@@ -352,11 +384,14 @@ class PackageInstaller
             return $artifact->isBinaryExtracted();
         }
         // Fallback: if the download cache is missing (e.g. download failed or cache was cleared),
-        // still check whether the files are physically present in buildroot.
-        // Note: TargetPackage extends LibraryPackage, but target packages (e.g. zig) have no
-        // static-libs/headers configured, so isInstalled() would trivially return true for them.
-        // Only apply this fallback to pure library packages.
-        if ($package instanceof LibraryPackage && !($package instanceof TargetPackage)) {
+        // still check whether the declared outputs are physically present. TargetPackage extends
+        // LibraryPackage and reaches this too; a target without declared outputs is simply never
+        // "installed", so no package-type special case is needed here.
+        if ($package instanceof LibraryPackage) {
+            return $package->isInstalled();
+        }
+        // Tool packages: fall back to checking their provided binaries directly on disk.
+        if ($package instanceof ToolPackage) {
             return $package->isInstalled();
         }
         return false;
@@ -516,6 +551,16 @@ class PackageInstaller
         }
 
         $status = $extractor->extract($artifact);
+
+        // Record the installed version for tool packages, so `check-update --installed` can
+        // compare against what's actually on disk instead of only the download cache (which
+        // only reflects the last download and may be stale or cleared). Recorded regardless of
+        // $status so the registry self-heals if it was deleted separately from the install dir.
+        if ($package instanceof ToolPackage) {
+            $cache_info = ApplicationContext::get(ArtifactCache::class)->getBinaryInfo($artifact->getName(), SystemTarget::getCurrentPlatformString());
+            ToolVersionRegistry::record($artifact->getName(), $cache_info['version'] ?? null);
+        }
+
         if ($status === SPC_STATUS_ALREADY_EXTRACTED) {
             return SPC_STATUS_ALREADY_INSTALLED;
         }
@@ -655,6 +700,66 @@ class PackageInstaller
     }
 
     /**
+     * Collect all tool packages required by the currently resolved packages.
+     *
+     * Reads the 'tools' field from each resolved package's YAML config.
+     * The field supports platform suffixes (tools@windows, tools@linux, etc.)
+     * resolved automatically by PackageConfig::get().
+     *
+     * Tools are NOT part of the library dependency graph — they are
+     * build-time prerequisites that must be installed before any library
+     * build begins.
+     *
+     * @return string[] Unique tool package names required for this build
+     */
+    public function collectRequiredTools(): array
+    {
+        $tools = [];
+        foreach ($this->packages as $package) {
+            $deps = PackageConfig::get($package->getName(), 'tools', []);
+            foreach ((array) $deps as $tool_name) {
+                $tools[$tool_name] = true;
+            }
+        }
+        return array_keys($tools);
+    }
+
+    /**
+     * Check that all required tools are installed.
+     *
+     * Iterates through tools collected by collectRequiredTools(),
+     * resolves each to a ToolPackage instance, and checks isInstalled().
+     *
+     * @return array{missing: array<string>, installed: array<string>}
+     */
+    public function checkRequiredTools(): array
+    {
+        $missing = [];
+        $installed = [];
+        foreach ($this->collectRequiredTools() as $tool_name) {
+            try {
+                $tool = PackageLoader::getPackage($tool_name);
+            } catch (WrongUsageException) {
+                $missing[] = $tool_name;
+                logger()->warning("Required tool '{$tool_name}' is not registered as a package.");
+                continue;
+            }
+
+            if (!$tool instanceof ToolPackage) {
+                logger()->warning("Package '{$tool_name}' is declared as a tool dependency but is not a ToolPackage (type: {$tool->getType()}).");
+                continue;
+            }
+
+            if ($tool->isInstalled()) {
+                $installed[] = $tool_name;
+            } else {
+                $missing[] = $tool_name;
+            }
+        }
+        return ['missing' => $missing, 'installed' => $installed];
+    }
+
+    /**
      * @param Package[] $packages
      */
     private function dumpLicenseFiles(array $packages): void
@@ -677,8 +782,8 @@ class PackageInstaller
      */
     private function validatePackageArtifact(Package $package): void
     {
-        // target and library must have at least source or platform binary
-        if (in_array($package->getType(), ['library', 'target']) && !$package->getArtifact()?->hasSource() && !$package->getArtifact()?->hasPlatformBinary()) {
+        // target, library and tool packages must have at least source or platform binary
+        if (in_array($package->getType(), ['library', 'target', 'tool']) && !$package->getArtifact()?->hasSource() && !$package->getArtifact()?->hasPlatformBinary()) {
             throw new WrongUsageException("Validation failed: Target package '{$package->getName()}' has no source or current platform (" . SystemTarget::getCurrentPlatformString() . ') binary defined.');
         }
     }
@@ -707,13 +812,176 @@ class PackageInstaller
             $this->options['with-suggests'] ?? false
         );
 
+        // gather packages declared by the active toolchain (e.g. the compiler runtime zig does
+        // not ship). They are prepended so they are built before the packages that need them, and
+        // they join as regular install packages so the normal pipeline downloads/builds them and
+        // their own isInstalled() decides skip vs rebuild.
+        $this->toolchain_packages_required = $this->runCompilesSomething($resolved_packages);
+        if ($this->toolchain_packages_required) {
+            $toolchain_packages = array_values(array_filter(
+                $this->collectToolchainPackages(),
+                static fn (string $package): bool => !in_array($package, $pkgs, true)
+            ));
+            // They are fetched pre-built where a binary is published (llvm-tools): building them
+            // from source is only the fallback, unless the user asked for source-only downloads.
+            if ($toolchain_packages !== []) {
+                $this->preferBinary(...$toolchain_packages);
+                $pkgs = [...$toolchain_packages, ...$pkgs];
+                $resolved_packages = DependencyResolver::resolve(
+                    $pkgs,
+                    $this->target_additional_dependencies,
+                    $this->options['with-suggests'] ?? false
+                );
+            }
+        } else {
+            logger()->debug('Nothing is compiled from source in this run, skipping toolchain packages.');
+        }
+
         foreach ($resolved_packages as $pkg_name) {
             $this->packages[$pkg_name] = PackageLoader::getPackage($pkg_name);
         }
 
+        // Merge in build-time tool packages declared via 'tools'/'tools@platform' fields on the
+        // packages resolved above. Tools are intentionally NOT part of the library dependency graph
+        // (DependencyResolver), but still need to ride the normal download/extract/install pipeline
+        // so they get auto-installed like any other package.
+        //
+        // Tools are prepended so they install BEFORE any package that declares them — otherwise a
+        // library that invokes e.g. jom.exe during its build stage would fail because the tool
+        // hasn't been extracted yet (tools were appended after the dependency graph in insertion
+        // order, which is also the build-loop iteration order).
+        $tool_packages = [];
+        foreach ($this->collectRequiredTools() as $tool_name) {
+            if (isset($this->packages[$tool_name])) {
+                continue;
+            }
+            try {
+                $tool = PackageLoader::getPackage($tool_name);
+            } catch (WrongUsageException) {
+                continue; // will be reported as missing by ensureRequiredTools()
+            }
+            if ($tool instanceof ToolPackage) {
+                $tool_packages[$tool_name] = $tool;
+            }
+        }
+        // Prepend: tools first, then the dependency-resolved packages.
+        $this->packages = [...$tool_packages, ...$this->packages];
+
         foreach ($this->packages as $package) {
             $this->injectPackageEnvs($package);
         }
+    }
+
+    /**
+     * Whether this run builds at least one package from source.
+     *
+     * The toolchain packages supply the compiler and its runtime, so they are only needed when
+     * something is actually compiled. Library and tool packages that are installed from a platform
+     * binary, and tool packages without a build stage (e.g. zig itself), need no compiler.
+     *
+     * @param string[] $resolved_packages Package names resolved for this run
+     */
+    private function runCompilesSomething(array $resolved_packages): bool
+    {
+        return array_any($resolved_packages, fn ($pkg_name) => $this->willCompilePackage(PackageLoader::getPackage($pkg_name)));
+    }
+
+    /**
+     * Whether the build loop compiles this package instead of installing a prebuilt binary.
+     *
+     * Mirrors the branch selection in run(): build packages are fetched as source and always
+     * compiled, and an install package is compiled only when it has a build stage with source but
+     * no platform binary to install. Every platform that publishes a binary installs it here,
+     * because run() only forces source-only downloads for build packages.
+     */
+    private function willCompilePackage(Package $package): bool
+    {
+        if ($this->isBuildPackage($package)) {
+            return true;
+        }
+        return $package->hasStage('build')
+            && $package->hasSource()
+            && !($package->getArtifact()?->hasPlatformBinary() ?? false);
+    }
+
+    /**
+     * Report, once per run, any package the active toolchain declared that is still missing.
+     *
+     * This runs after the build/install loop on purpose: that is the first moment the result of
+     * this run is final. The typical case is a machine without zig, where the run installs zig and
+     * can only pick up the packages that depend on it (compiler-rt) on the next one - the compiler
+     * wrapper cannot explain that, and it would repeat the warning for every compile and link.
+     */
+    private function warnAboutMissingToolchainPackages(): void
+    {
+        // A run that compiled nothing never asked for the toolchain packages, so a missing zig is
+        // not a problem here: warning about it would only tell the user to "build again" after a
+        // plain `install-pkg pkg-config`.
+        if (!$this->toolchain_packages_required) {
+            return;
+        }
+        $toolchain = ToolchainManager::getToolchain();
+        if (!$toolchain instanceof PackageRequirementsInterface) {
+            return;
+        }
+        foreach ($toolchain->getRequiredPackages() as $package_name) {
+            if (!PackageLoader::hasPackage($package_name)) {
+                continue;
+            }
+            if (PackageLoader::getPackage($package_name)->isInstalled()) {
+                continue;
+            }
+            logger()->warning(
+                "'{$package_name}' is required by the active toolchain but is not installed. "
+                . 'Run the build again to install it: a run that installs the toolchain itself can '
+                . 'only add its dependent packages on the next one.'
+            );
+        }
+    }
+
+    /**
+     * Package names the active toolchain needs for the current target.
+     *
+     * @return string[]
+     */
+    private function collectToolchainPackages(): array
+    {
+        $toolchain = ToolchainManager::getToolchain();
+        if (!$toolchain instanceof PackageRequirementsInterface) {
+            return [];
+        }
+        $packages = $toolchain->getRequiredPackages();
+        if ($packages === [] && ($missing = $toolchain->checkRequirements()) !== []) {
+            // Not fatal: whoever owns the prerequisite installs it first (doctor for zig), after
+            // which the toolchain packages become available on a later run.
+            logger()->warning('Toolchain packages are not available yet, waiting for: ' . implode(', ', $missing));
+        }
+        return $packages;
+    }
+
+    /**
+     * Ensure all required tools are installed, throwing if any are missing.
+     *
+     * Called at the end of run(), after the normal download/extract/build/install pipeline
+     * has had a chance to auto-install any tool package merged in resolvePackages(). This is
+     * a final safety net: it only throws if a declared tool still isn't available afterward
+     * (e.g. no artifact defined for the current platform, or the tool name doesn't resolve to
+     * a registered ToolPackage). "General" tools not declared via any package's 'tools' field
+     * (e.g. zig, musl-toolchain) are not covered here and remain purely Doctor-driven.
+     */
+    private function ensureRequiredTools(): void
+    {
+        $status = $this->checkRequiredTools();
+        if (empty($status['missing'])) {
+            if (!empty($status['installed'])) {
+                logger()->info('Required tools: ' . implode(', ', $status['installed']) . ' — all installed.');
+            }
+            return;
+        }
+
+        $msg = 'Missing required build tools: ' . implode(', ', $status['missing']) . "\n";
+        $msg .= "Run 'bin/spc doctor' to check your environment, or install the missing tools manually.";
+        throw new EnvironmentException($msg);
     }
 
     private function injectPackageEnvs(Package $package): void

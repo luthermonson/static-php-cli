@@ -45,7 +45,9 @@ class php_src
                 FileSystem::replaceFileStr(SOURCE_PATH . '/php-src/ext/gd/libgd/gdft.c', '#ifndef MSWIN32', '#ifndef _WIN32');
             }
             // custom config.w32, because official config.w32 is hard-coded many things
-            if ($ver_id >= 80500) {
+            if ($ver_id >= 80600) {
+                $origin = file_get_contents(ROOT_DIR . '/src/globals/extra/gd_config_86.w32');
+            } elseif ($ver_id >= 80500) {
                 $origin = file_get_contents(ROOT_DIR . '/src/globals/extra/gd_config_85.w32');
             } elseif ($ver_id >= 80100) {
                 $origin = file_get_contents(ROOT_DIR . '/src/globals/extra/gd_config_81.w32');
@@ -61,8 +63,11 @@ class php_src
     #[PatchDescription('Add LICENSE file to IMAP extension if missing')]
     public function patchImapLicense(): void
     {
-        if (!file_exists(SOURCE_PATH . '/php-src/ext/imap/LICENSE') && is_dir(SOURCE_PATH . '/php-src/ext/imap')) {
-            file_put_contents(SOURCE_PATH . '/php-src/ext/imap/LICENSE', file_get_contents(ROOT_DIR . '/src/globals/extra/Apache_LICENSE'));
+        $imap_dir = SOURCE_PATH . '/php-src/ext/imap';
+        // only bundled imap (PHP < 8.4) needs a license file; newer php-src may keep
+        // an ext/imap/tests stub that is not a buildable extension
+        if (is_file("{$imap_dir}/config.m4") && !file_exists("{$imap_dir}/LICENSE")) {
+            file_put_contents("{$imap_dir}/LICENSE", file_get_contents(ROOT_DIR . '/src/globals/extra/Apache_LICENSE'));
         }
     }
 }

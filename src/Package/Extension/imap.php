@@ -34,7 +34,7 @@ class imap extends PhpExtensionPackage
         // zend_zval_value_name() was introduced in PHP 8.3; PHP 8.2 imap backported the call but not the declaration
         // replace with the equivalent PHP 8.2-compatible function
         FileSystem::replaceFileStr(
-            "{$this->getSourceDir()}/php_imap.c",
+            "{$this->getBuildDir()}/php_imap.c",
             'zend_zval_value_name(data)',
             'zend_zval_type_name(data)'
         );
@@ -46,11 +46,26 @@ class imap extends PhpExtensionPackage
         if ($installer->getLibraryPackage('openssl')) {
             // sometimes imap with openssl does not contain zlib (required by openssl)
             // we need to add it manually
-            FileSystem::replaceFileStr("{$this->getSourceDir()}/config.m4", 'TST_LIBS="$DLIBS $IMAP_SHARED_LIBADD"', 'TST_LIBS="$DLIBS $IMAP_SHARED_LIBADD -lz"');
+            FileSystem::replaceFileStr("{$this->getBuildDir()}/config.m4", 'TST_LIBS="$DLIBS $IMAP_SHARED_LIBADD"', 'TST_LIBS="$DLIBS $IMAP_SHARED_LIBADD -lz"');
+            if (php::getPHPVersionID() >= 80400) {
+                // The php target passes OPENSSL_LIBS="-lz" for the openssl extension on
+                // PHP 8.4+, so PHP_SETUP_OPENSSL() only adds -lz to IMAP_SHARED_LIBADD
+                // here. Link the SSL libraries explicitly for the c-client link tests.
+                $config_m4 = "{$this->getBuildDir()}/config.m4";
+                if (!str_contains(FileSystem::readFile($config_m4), 'PHP_ADD_LIBRARY(ssl,, IMAP_SHARED_LIBADD)')) {
+                    FileSystem::replaceFileStr(
+                        $config_m4,
+                        "    PHP_SETUP_OPENSSL([IMAP_SHARED_LIBADD],\n      [AC_DEFINE([HAVE_IMAP_SSL], [1], [ ])])",
+                        "    PHP_SETUP_OPENSSL([IMAP_SHARED_LIBADD],\n      [AC_DEFINE([HAVE_IMAP_SSL], [1], [ ])])\n"
+                        . "    PHP_ADD_LIBRARY(ssl,, IMAP_SHARED_LIBADD)\n"
+                        . '    PHP_ADD_LIBRARY(crypto,, IMAP_SHARED_LIBADD)'
+                    );
+                }
+            }
         }
         // c-client is built with PASSWDTYPE=nul so libcrypt is not referenced.
         FileSystem::replaceFileStr(
-            "{$this->getSourceDir()}/config.m4",
+            "{$this->getBuildDir()}/config.m4",
             "    PHP_CHECK_LIBRARY(crypt, crypt,\n    [\n      PHP_ADD_LIBRARY(crypt,, IMAP_SHARED_LIBADD)\n      AC_DEFINE(HAVE_LIBCRYPT,1,[ ])\n    ])",
             '    dnl Skipped: crypt check not needed (c-client built with PASSWDTYPE=nul)'
         );
