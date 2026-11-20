@@ -63,13 +63,21 @@ class SourcePatcher
             return true;
         }
 
-        // Apply patch
-        $apply_cmd = $cd_cmd
-            . ' && patch --binary -p1'
-            . ($reverse ? ' -R' : '')
-            . ' < ' . escapeshellarg($patch_arg);
+        // Apply patch. --binary keeps CRLF intact, which is right when the source checkout and the
+        // patch share line endings (e.g. a git checkout with autocrlf on Windows). When they differ
+        // -- a php-src extracted with LF endings on Windows, patched by a CRLF patch -- --binary
+        // refuses to match. Fall back to a CR-stripping apply (plain `patch`, which also allows the
+        // usual fuzz) before giving up, so the same patch applies regardless of the source's endings.
+        $reverse_arg = $reverse ? ' -R' : '';
+        $apply_cmd = $cd_cmd . ' && patch --binary -p1' . $reverse_arg . ' < ' . escapeshellarg($patch_arg);
 
         $apply_status = self::execPatchCommand($apply_cmd);
+        if ($apply_status !== 0) {
+            // --binary refused (line-ending mismatch). A --binary apply that fully fails leaves the
+            // tree untouched, so retrying is safe; -f keeps it non-interactive in CI.
+            $fallback_cmd = $cd_cmd . ' && patch -p1 -f' . $reverse_arg . ' < ' . escapeshellarg($patch_arg);
+            $apply_status = self::execPatchCommand($fallback_cmd);
+        }
         if ($apply_status !== 0) {
             throw new PatchException($patch_name, "Patch file [{$patch_name}] failed to apply");
         }
