@@ -226,7 +226,7 @@ class DefaultShell extends Shell
 
         match ($extname) {
             'tar' => $this->executeTarExtract($archive_path, $target_path, 'none'),
-            'gz', 'tgz', 'xz', 'txz', 'bz2' => $this->extract7zWithStripComponents($archive_path, $target_path, $_7z),
+            'gz', 'tgz', 'xz', 'txz', 'bz2' => $run("{$_7z} x -so {$archive_arg} | {$tar} -f - -x -C {$target_arg} --strip-components 1"),
             default => $run("{$_7z} x {$archive_arg} -o{$target_arg} -y{$mute}"),
         };
 
