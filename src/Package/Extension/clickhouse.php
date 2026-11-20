@@ -4,10 +4,14 @@ declare(strict_types=1);
 
 namespace Package\Extension;
 
+use Package\Target\php;
+use StaticPHP\Attribute\Package\BeforeStage;
 use StaticPHP\Attribute\Package\CustomPhpConfigureArg;
 use StaticPHP\Attribute\Package\Extension;
+use StaticPHP\Attribute\PatchDescription;
 use StaticPHP\Package\PackageInstaller;
 use StaticPHP\Package\PhpExtensionPackage;
+use StaticPHP\Util\FileSystem;
 
 #[Extension('clickhouse')]
 class clickhouse extends PhpExtensionPackage
